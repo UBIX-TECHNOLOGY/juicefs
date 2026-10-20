@@ -141,7 +141,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 
 	if s.store.seekable &&
 		(!s.store.conf.CacheEnabled() || (boff > 0 && len(p) <= blockSize/4)) {
-		n, err = s.store.loadRange(ctx, key, page, boff)
+		n, err = s.store.loadRange(ctx, s.id, key, page, boff)
 		if err == nil || !errors.Is(err, errTryFullRead) {
 			return n, err
 		}
@@ -154,7 +154,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		} else {
 			tmp.Acquire()
 		}
-		err = s.store.load(ctx, key, tmp, s.store.shouldCache(blockSize), false)
+		err = s.store.load(ctx, s.id, key, tmp, s.store.shouldCache(blockSize), false)
 		return tmp, err
 	})
 	defer block.Release()
@@ -169,7 +169,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 
 func (s *rSlice) delete(indx int) error {
 	key := s.key(indx)
-	return s.store.delete(key)
+	return s.store.delete(s.id, key)
 }
 
 func (s *rSlice) Remove() error {
@@ -297,7 +297,7 @@ func (s *wSlice) WriteAt(p []byte, off int64) (n int, err error) {
 	return n, nil
 }
 
-func (store *cachedStore) put(ctx context.Context, key string, p *Page) error {
+func (store *cachedStore) put(ctx context.Context, id uint64, key string, p *Page) error {
 	if store.upLimit != nil {
 		store.upLimit.Wait(int64(len(p.Data)))
 	}
@@ -309,7 +309,7 @@ func (store *cachedStore) put(ctx context.Context, key string, p *Page) error {
 	return utils.WithTimeout(ctx, func(ctx context.Context) error {
 		defer p.Release()
 		st := time.Now()
-		err := store.storage.Put(ctx, key, bytes.NewReader(p.Data), object.WithRequestID(&reqID), object.WithStorageClass(&sc))
+		err := store.storageForBlock(id, key).Put(ctx, key, bytes.NewReader(p.Data), object.WithRequestID(&reqID), object.WithStorageClass(&sc))
 		used := time.Since(st)
 		logRequest("PUT", key, "", reqID, err, used)
 		store.objectDataBytes.WithLabelValues("PUT", sc).Add(float64(len(p.Data)))
@@ -321,11 +321,11 @@ func (store *cachedStore) put(ctx context.Context, key string, p *Page) error {
 	}, store.conf.PutTimeout)
 }
 
-func (store *cachedStore) delete(key string) error {
+func (store *cachedStore) delete(id uint64, key string) error {
 	st := time.Now()
 	var reqID string
 	err := utils.WithTimeout(context.TODO(), func(ctx context.Context) error {
-		return store.storage.Delete(ctx, key, object.WithRequestID(&reqID))
+		return store.storageForBlock(id, key).Delete(ctx, key, object.WithRequestID(&reqID))
 	}, store.conf.PutTimeout)
 	used := time.Since(st)
 	if err != nil && (strings.Contains(err.Error(), "NoSuchKey") ||
@@ -341,7 +341,10 @@ func (store *cachedStore) delete(key string) error {
 	return err
 }
 
-func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s *wSlice) error {
+// id is the full slice id when the caller has it (active write paths);
+// replay paths that only hold a key pass 0 and routing falls back to
+// parsing the key.
+func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s *wSlice, id uint64) error {
 	sync := s != nil
 	blen := len(block.Data)
 	bufSize := store.compressor.CompressBound(blen)
@@ -374,7 +377,7 @@ func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s
 			err = fmt.Errorf("(cancelled) upload block %s: %s (after %d tries)", key, err, try)
 			break
 		}
-		if err = store.put(ctx, key, buf); err == nil {
+		if err = store.put(ctx, id, key, buf); err == nil {
 			break
 		}
 		logger.Debugf("Upload %s: %s (try %d)", key, err, try+1)
@@ -442,7 +445,7 @@ func (s *wSlice) upload(indx int) {
 					select {
 					case s.store.currentUpload <- struct{}{}:
 						defer func() { <-s.store.currentUpload }()
-						if err = s.store.upload(ctx, key, block, nil); err == nil {
+						if err = s.store.upload(ctx, key, block, nil, s.id); err == nil {
 							s.store.bcache.uploaded(key, blen)
 							if err := s.store.bcache.removeStage(key); err != nil {
 								logger.Warnf("failed to remove stage %s in upload", stagingPath)
@@ -461,7 +464,7 @@ func (s *wSlice) upload(indx int) {
 		}
 		s.store.currentUpload <- struct{}{}
 		defer func() { <-s.store.currentUpload }()
-		s.errors <- s.store.upload(ctx, key, block, s)
+		s.errors <- s.store.upload(ctx, key, block, s, s.id)
 	}()
 }
 
@@ -662,6 +665,9 @@ func (c *Config) CacheEnabled() bool {
 
 type cachedStore struct {
 	storage         object.ObjectStorage
+	resolver        func(cluster uint8) (object.ObjectStorage, error)
+	clusterMu       sync.Mutex
+	clusterStorages map[uint8]object.ObjectStorage
 	bcache          CacheManager
 	fetcher         *prefetcher
 	conf            Config
@@ -706,7 +712,7 @@ type getResult struct {
 	sc    string
 }
 
-func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page, off int) (int, error) {
+func (store *cachedStore) loadRange(ctx context.Context, id uint64, key string, page *Page, off int) (int, error) {
 	p := page.Data
 	fullPage, err := store.group.TryPiggyback(key)
 	if fullPage != nil {
@@ -728,7 +734,7 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 	page.Acquire()
 	err = utils.WithTimeout(ctx, func(cCtx context.Context) error {
 		defer page.Release()
-		in, getErr := store.storage.Get(cCtx, key, int64(off), int64(len(p)), object.WithRequestID(&tmp.reqID), object.WithStorageClass(&tmp.sc))
+		in, getErr := store.storageForBlock(id, key).Get(cCtx, key, int64(off), int64(len(p)), object.WithRequestID(&tmp.reqID), object.WithStorageClass(&tmp.sc))
 		if getErr == nil {
 			tmp.n, getErr = io.ReadFull(in, p)
 			_ = in.Close()
@@ -759,7 +765,7 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 	return 0, errTryFullRead
 }
 
-func (store *cachedStore) load(ctx context.Context, key string, page *Page, cache bool, forceCache bool) (err error) {
+func (store *cachedStore) load(ctx context.Context, id uint64, key string, page *Page, cache bool, forceCache bool) (err error) {
 	defer func() {
 		e := recover()
 		if e != nil {
@@ -790,7 +796,7 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 	err = utils.WithTimeout(ctx, func(cCtx context.Context) error {
 		defer p.Release()
 		// it will be retried in the upper layer.
-		in, getErr := store.storage.Get(cCtx, key, 0, -1, object.WithRequestID(&tmp.reqID), object.WithStorageClass(&tmp.sc))
+		in, getErr := store.storageForBlock(id, key).Get(cCtx, key, 0, -1, object.WithRequestID(&tmp.reqID), object.WithStorageClass(&tmp.sc))
 		if getErr == nil {
 			tmp.n, getErr = io.ReadFull(in, p.Data)
 			_ = in.Close()
@@ -908,7 +914,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		defer p.Release()
 		block, err := store.group.Execute(key, func() (*Page, error) { // dedup requests with full read
 			p.Acquire()
-			err := store.load(context.TODO(), key, p, false, false) // delay writing cache until singleflight ends to prevent blocking waiters
+			err := store.load(context.TODO(), 0, key, p, false, false) // delay writing cache until singleflight ends to prevent blocking waiters
 			return p, err
 		})
 		defer block.Release()
@@ -1093,9 +1099,9 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	}
 	ctx := context.WithValue(context.Background(), object.TierKey{}, tierID)
 	store.stageBlockDelay.Add(time.Since(item.ts).Seconds())
-	if err = store.upload(ctx, key, block, nil); err == nil {
+	if err = store.upload(ctx, key, block, nil, 0); err == nil {
 		if !store.isPendingValid(key) { // Delete leaked objects if it's already deleted by other goroutines
-			err := store.delete(key)
+			err := store.delete(0, key)
 			logger.Infof("Key %s is not needed, abandoned, err: %v", key, err)
 		} else {
 			store.bcache.uploaded(key, blen)
@@ -1228,7 +1234,7 @@ func (store *cachedStore) FillCache(id uint64, size uint32, parts []Range) error
 			continue
 		}
 		p := NewOffPage(size)
-		if e := store.load(context.TODO(), k, p, true, true); e != nil {
+		if e := store.load(context.TODO(), r.id, k, p, true, true); e != nil {
 			logger.Warnf("Failed to load key: %s %s", k, e)
 			err = e
 		}

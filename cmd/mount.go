@@ -675,6 +675,23 @@ func mount(c *cli.Context) error {
 	registerer, registry := wrapRegister(c, mp, format.Name)
 
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
+	store.SetClusterResolver(func(cluster uint8) (object.ObjectStorage, error) {
+		f := metaCli.GetFormat() // fresh format, so newly registered clusters are connectable
+		oc := f.ObjectClusterByID(cluster)
+		if oc == nil {
+			return nil, fmt.Errorf("object cluster %d is not registered", cluster)
+		}
+		cf, err := clusterFor(f, oc)
+		if err != nil {
+			return nil, err
+		}
+		b, err := createStorage(*cf)
+		if err != nil {
+			return nil, err
+		}
+		logger.Infof("Connected object storage cluster %d: %s", cluster, b)
+		return b, nil
+	})
 	registerMetaMsg(metaCli, store, chunkConf)
 
 	err = metaCli.NewSession(true)

@@ -5535,7 +5535,7 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				continue
 			}
 			nameSet[name] = struct{}{}
-			dstIno, err := m.nextInode()
+			dstIno, err := m.nextInode(ctx, e.Inode)
 			if err != nil {
 				return errno(err)
 			}

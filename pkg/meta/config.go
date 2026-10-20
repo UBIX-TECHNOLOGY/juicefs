@@ -108,8 +108,47 @@ type Format struct {
 	ChangeLogMaxAge   int64  `json:",omitempty"`
 	ChangeLogMaxLines int64  `json:",omitempty"`
 
+	// ObjectClusters is the registry of EXTRA object storage sub-clusters.
+	// Cluster 0 is implicit and always mirrors the top-level Storage/Bucket
+	// fields; entries here carry contiguous ids starting from 1. The
+	// registry is append-only: existing entries can never be modified.
+	ObjectClusters []ObjectCluster `json:",omitempty"`
+
 	//kerberos
 	KerbConf string `json:",omitempty"`
+}
+
+// ObjectCluster describes one object storage sub-cluster. File data of an
+// inode is routed to the cluster recorded in the inode's objectID bits.
+type ObjectCluster struct {
+	ID           uint8
+	Storage      string
+	StorageClass string `json:",omitempty"`
+	Bucket       string
+	AccessKey    string `json:",omitempty"`
+	SecretKey    string `json:",omitempty"`
+	SessionToken string `json:",omitempty"`
+}
+
+// ObjectClusterByID returns the registered cluster with the given id.
+// Cluster 0 is always the top-level storage config; ids >= 1 come from the
+// registry. It returns nil if the id is not registered.
+func (f *Format) ObjectClusterByID(id uint8) *ObjectCluster {
+	if id == 0 {
+		return &ObjectCluster{
+			ID:           0,
+			Storage:      f.Storage,
+			StorageClass: f.StorageClass,
+			Bucket:       f.Bucket,
+			AccessKey:    f.AccessKey,
+			SecretKey:    f.SecretKey,
+			SessionToken: f.SessionToken,
+		}
+	}
+	if int(id) <= len(f.ObjectClusters) && f.ObjectClusters[id-1].ID == id {
+		return &f.ObjectClusters[id-1]
+	}
+	return nil
 }
 
 // Clone returns a deep copy of the format.
@@ -121,13 +160,23 @@ func (f *Format) Clone() *Format {
 			c.Tiers[id] = t
 		}
 	}
+	if f.ObjectClusters != nil {
+		c.ObjectClusters = make([]ObjectCluster, len(f.ObjectClusters))
+		copy(c.ObjectClusters, f.ObjectClusters)
+	}
 	return &c
 }
 
 func (f *Format) update(old *Format, force bool) error {
+	if err := f.validateObjectClusters(); err != nil {
+		return err
+	}
 	if force {
 		logger.Warnf("Existing volume will be overwrited: %s", old)
 	} else {
+		if !f.objectClustersAppendOnly(old) {
+			return fmt.Errorf("existing object clusters cannot be modified; only appending new clusters is allowed")
+		}
 		var args []interface{}
 		switch {
 		case f.Name != old.Name:
@@ -160,6 +209,47 @@ func (f *Format) update(old *Format, force bool) error {
 	return nil
 }
 
+// validateObjectClusters checks that the registry is well-formed:
+// ids are contiguous from 1 (0 is the implicit top-level cluster), and the
+// total count does not exceed the 8-bit object id limit.
+func (f *Format) validateObjectClusters() error {
+	if len(f.ObjectClusters) > int(MaxObjectID) {
+		return fmt.Errorf("too many object clusters: %d; max %d", len(f.ObjectClusters), MaxObjectID)
+	}
+	for i, c := range f.ObjectClusters {
+		if c.ID != uint8(i+1) {
+			return fmt.Errorf("object cluster ids must be contiguous from 1: index %d has id %d", i, c.ID)
+		}
+	}
+	return nil
+}
+
+// objectClustersAppendOnly reports whether new is old plus appended
+// entries only: every entry present in old must be unchanged. Secrets are
+// compared after decryption because re-encrypting a format applies a fresh
+// nonce, which would otherwise make unchanged entries look modified.
+func (f *Format) objectClustersAppendOnly(old *Format) bool {
+	if len(f.ObjectClusters) < len(old.ObjectClusters) {
+		return false
+	}
+	newClusters, oldClusters := f.ObjectClusters, old.ObjectClusters
+	if f.KeyEncrypted || old.KeyEncrypted {
+		nf, of := *f, *old
+		nf.ObjectClusters = append([]ObjectCluster(nil), f.ObjectClusters...)
+		of.ObjectClusters = append([]ObjectCluster(nil), old.ObjectClusters...)
+		if nf.Decrypt() != nil || of.Decrypt() != nil {
+			return false
+		}
+		newClusters, oldClusters = nf.ObjectClusters, of.ObjectClusters
+	}
+	for i, c := range oldClusters {
+		if newClusters[i] != c {
+			return false
+		}
+	}
+	return true
+}
+
 func (f *Format) RemoveSecret() {
 	if f.SecretKey != "" {
 		f.SecretKey = "removed"
@@ -169,6 +259,14 @@ func (f *Format) RemoveSecret() {
 	}
 	if f.EncryptKey != "" {
 		f.EncryptKey = "removed"
+	}
+	for i := range f.ObjectClusters {
+		if f.ObjectClusters[i].SecretKey != "" {
+			f.ObjectClusters[i].SecretKey = "removed"
+		}
+		if f.ObjectClusters[i].SessionToken != "" {
+			f.ObjectClusters[i].SessionToken = "removed"
+		}
 	}
 }
 
@@ -243,7 +341,14 @@ func newCipher(algo string, key string) (cipher.AEAD, error) {
 }
 
 func (f *Format) Encrypt() error {
-	if f.KeyEncrypted || f.SecretKey == "" && f.EncryptKey == "" && f.SessionToken == "" {
+	if f.KeyEncrypted {
+		return nil
+	}
+	hasSecret := f.SecretKey != "" || f.EncryptKey != "" || f.SessionToken != ""
+	for i := range f.ObjectClusters {
+		hasSecret = hasSecret || f.ObjectClusters[i].SecretKey != "" || f.ObjectClusters[i].SessionToken != ""
+	}
+	if !hasSecret {
 		return nil
 	}
 	ci, err := newCipher(f.EncryptAlgo, f.UUID)
@@ -268,6 +373,10 @@ func (f *Format) Encrypt() error {
 	encrypt(&f.SecretKey)
 	encrypt(&f.SessionToken)
 	encrypt(&f.EncryptKey)
+	for i := range f.ObjectClusters {
+		encrypt(&f.ObjectClusters[i].SecretKey)
+		encrypt(&f.ObjectClusters[i].SessionToken)
+	}
 	f.KeyEncrypted = true
 	return nil
 }
@@ -305,6 +414,10 @@ func (f *Format) Decrypt() error {
 	decrypt(&f.EncryptKey)
 	decrypt(&f.SecretKey)
 	decrypt(&f.SessionToken)
+	for i := range f.ObjectClusters {
+		decrypt(&f.ObjectClusters[i].SecretKey)
+		decrypt(&f.ObjectClusters[i].SessionToken)
+	}
 	f.KeyEncrypted = false
 	return err
 }

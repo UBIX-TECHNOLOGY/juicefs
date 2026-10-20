@@ -470,7 +470,10 @@ func (opt *LoadOption) check() {
 func (c *DumpedCounters) updateFromSegment(seg *BakSegment, counters *[]*pb.Counter) bool {
 	recordInode := func(inode uint64) {
 		if Ino(inode) < TrashInode {
-			c.NextInode = max(c.NextInode, int64(inode)+1)
+			// KV engines compose inodes as version|objectID|inodeID;
+			// the nextInode counter only tracks the raw 50-bit inode ID
+			id := Ino(inode).inodeID()
+			c.NextInode = max(c.NextInode, int64(id)+1)
 		} else {
 			c.NextTrash = max(c.NextTrash, int64(Ino(inode)-TrashInode))
 		}
@@ -506,12 +509,12 @@ func (c *DumpedCounters) updateFromSegment(seg *BakSegment, counters *[]*pb.Coun
 		for _, chunk := range seg.val.(*pb.Batch).Chunks {
 			recordInode(chunk.Inode)
 			for _, s := range readSliceBuf(chunk.Slices) {
-				c.NextChunk = max(c.NextChunk, int64(s.id)+1)
+				c.NextChunk = max(c.NextChunk, int64(sliceID(s.id))+1)
 			}
 		}
 	case segTypeSliceRef:
 		for _, ref := range seg.val.(*pb.Batch).SliceRefs {
-			c.NextChunk = max(c.NextChunk, int64(ref.Id)+1)
+			c.NextChunk = max(c.NextChunk, int64(sliceID(ref.Id))+1)
 		}
 	case segTypeSustained:
 		for _, sustained := range seg.val.(*pb.Batch).Sustained {

@@ -1555,7 +1555,7 @@ func (m *baseMeta) SetAttr(ctx Context, inode Ino, set uint16, sugidclearmode ui
 	return err
 }
 
-func (m *baseMeta) nextInode() (Ino, error) {
+func (m *baseMeta) nextInode(ctx Context, parent Ino) (Ino, error) {
 	m.freeMu.Lock()
 	defer m.freeMu.Unlock()
 	if m.freeInodes.next >= m.freeInodes.maxid {
@@ -1583,6 +1583,11 @@ func (m *baseMeta) nextInode() (Ino, error) {
 	}
 	if m.freeInodes.maxid-m.freeInodes.next == inodeNeedPrefetch {
 		go m.prefetchInodes()
+	}
+	// KV engines may compose the raw counter into the 8+6+50 bit layout;
+	// other engines keep the raw counter value as the inode.
+	if c, ok := m.en.(inodeComposer); ok {
+		return c.composeInode(ctx, n, parent)
 	}
 	return Ino(n), nil
 }
@@ -1663,7 +1668,7 @@ func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode
 	if err := m.checkQuota(ctx, space, inodes, ctx.Uid(), 0, parent); err != 0 {
 		return err
 	}
-	ino, err := m.nextInode()
+	ino, err := m.nextInode(ctx, parent)
 	if err != nil {
 		return errno(err)
 	}
@@ -2185,7 +2190,7 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 	return 0
 }
 
-func (m *baseMeta) NewSlice(ctx Context, id *uint64) syscall.Errno {
+func (m *baseMeta) NewSlice(ctx Context, objectID uint8, id *uint64) syscall.Errno {
 	m.freeMu.Lock()
 	defer m.freeMu.Unlock()
 	if m.freeSlices.next >= m.freeSlices.maxid {
@@ -2196,8 +2201,20 @@ func (m *baseMeta) NewSlice(ctx Context, id *uint64) syscall.Errno {
 		m.freeSlices.next = uint64(v) - sliceIdBatch
 		m.freeSlices.maxid = uint64(v)
 	}
-	*id = m.freeSlices.next
+	n := m.freeSlices.next
 	m.freeSlices.next++
+	// KV engines may compose the raw counter into the 8+56 bit layout so
+	// the slice id itself routes to its owning sub-cluster; other engines
+	// keep the raw counter value.
+	if c, ok := m.en.(sliceComposer); ok {
+		sid, err := c.composeSliceID(ctx, n, objectID)
+		if err != nil {
+			return errno(err)
+		}
+		*id = sid
+		return 0
+	}
+	*id = n
 	return 0
 }
 
@@ -2914,7 +2931,13 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 	}
 
 	var id uint64
-	if st = m.NewSlice(Background(), &id); st != 0 {
+	// trash and other non-normal inodes carry no object id in their bits;
+	// their compacted data lands on the always-registered implicit cluster 0
+	objectID := uint8(0)
+	if inode.IsNormal() {
+		objectID = inode.objectID()
+	}
+	if st = m.NewSlice(Background(), objectID, &id); st != 0 {
 		return
 	}
 	logger.Debugf("compact %d:%d: skipped %d slices (%d bytes) %d slices (%d bytes)", inode, indx, skipped, pos, len(compacted), size)
@@ -3477,7 +3500,9 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 }
 
 func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, dstIno *Ino, cmode uint8, cumask uint16, count *uint64, top bool, concurrent chan struct{}) syscall.Errno {
-	ino, err := m.nextInode()
+	// a clone shares the source's chunk records, so it must inherit the
+	// source inode's object cluster id, not the parent's
+	ino, err := m.nextInode(ctx, srcIno)
 	if err != nil {
 		return errno(err)
 	}

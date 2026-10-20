@@ -992,7 +992,7 @@ func testMetaClient(t *testing.T, m Meta) {
 		t.Fatalf("open f: %s", st)
 	}
 	_ = m.Close(ctx, inode)
-	if st := m.NewSlice(ctx, &sliceId); st != 0 {
+	if st := m.NewSlice(ctx, 0, &sliceId); st != 0 {
 		t.Fatalf("write chunk: %s", st)
 	}
 	var s = Slice{Id: sliceId, Size: 100, Len: 100}
@@ -1907,11 +1907,11 @@ func testCompaction(t *testing.T, m Meta, trash bool) {
 
 	// random write
 	var sliceId uint64
-	m.NewSlice(ctx, &sliceId)
+	m.NewSlice(ctx, 0, &sliceId)
 	_ = m.Write(ctx, inode, 1, uint32(0), Slice{Id: sliceId, Size: 64 << 20, Len: 64 << 20}, time.Now())
-	m.NewSlice(ctx, &sliceId)
+	m.NewSlice(ctx, 0, &sliceId)
 	_ = m.Write(ctx, inode, 1, uint32(30<<20), Slice{Id: sliceId, Size: 8, Len: 8}, time.Now())
-	m.NewSlice(ctx, &sliceId)
+	m.NewSlice(ctx, 0, &sliceId)
 	_ = m.Write(ctx, inode, 1, uint32(40<<20), Slice{Id: sliceId, Size: 8, Len: 8}, time.Now())
 	var cs1 []Slice
 	_ = m.Read(ctx, inode, 1, &cs1)
@@ -1931,7 +1931,7 @@ func testCompaction(t *testing.T, m Meta, trash bool) {
 	var size uint32 = 100000
 	for i := 0; i < 200; i++ {
 		var sliceId uint64
-		m.NewSlice(ctx, &sliceId)
+		m.NewSlice(ctx, 0, &sliceId)
 		if st := m.Write(ctx, inode, 0, uint32(i)*size, Slice{Id: sliceId, Size: size, Len: size}, time.Now()); st != 0 {
 			t.Fatalf("write %d: %s", i, st)
 		}
@@ -2007,7 +2007,7 @@ func testCompaction(t *testing.T, m Meta, trash bool) {
 	if st := m.Truncate(ctx, inode, 0, 64<<10, attr, false); st != 0 {
 		t.Fatalf("truncate file: %s", st)
 	}
-	m.NewSlice(ctx, &sliceId)
+	m.NewSlice(ctx, 0, &sliceId)
 	_ = m.Write(ctx, inode, 0, uint32(1<<20), Slice{Id: sliceId, Size: 2 << 20, Len: 2 << 20}, time.Now())
 	if c, ok := m.(compactor); ok {
 		c.compactChunk(inode, 0, false, true, 0)
@@ -2020,13 +2020,13 @@ func testCompaction(t *testing.T, m Meta, trash bool) {
 			inode, len(slices), slices[0].Id, slices[1].Len)
 	}
 
-	m.NewSlice(ctx, &sliceId)
+	m.NewSlice(ctx, 0, &sliceId)
 	_ = m.Write(ctx, inode, 0, uint32(512<<10), Slice{Id: sliceId, Size: 2 << 20, Len: 64 << 10}, time.Now())
-	m.NewSlice(ctx, &sliceId)
+	m.NewSlice(ctx, 0, &sliceId)
 	_ = m.Write(ctx, inode, 0, uint32(0), Slice{Id: sliceId, Size: 1 << 20, Len: 64 << 10}, time.Now())
-	m.NewSlice(ctx, &sliceId)
+	m.NewSlice(ctx, 0, &sliceId)
 	_ = m.Write(ctx, inode, 0, uint32(128<<10), Slice{Id: sliceId, Size: 2 << 20, Len: 128 << 10}, time.Now())
-	m.NewSlice(ctx, &sliceId)
+	m.NewSlice(ctx, 0, &sliceId)
 	if st := m.Write(ctx, inode, 0, uint32(0), Slice{Id: sliceId, Size: 1 << 20, Len: 1 << 20}, time.Now()); st != 0 {
 		t.Fatalf("write 0: %s", st)
 	}
@@ -2040,11 +2040,11 @@ func testCompaction(t *testing.T, m Meta, trash bool) {
 		t.Fatalf("inode %d should be compacted, but have %d slices, size %d", inode, len(slices), slices[0].Len)
 	}
 
-	m.NewSlice(ctx, &sliceId)
+	m.NewSlice(ctx, 0, &sliceId)
 	_ = m.Write(ctx, inode, 2, 0, Slice{Id: sliceId, Size: 2338508, Len: 2338508}, time.Now())
-	m.NewSlice(ctx, &sliceId)
+	m.NewSlice(ctx, 0, &sliceId)
 	_ = m.Write(ctx, inode, 2, 8829056, Slice{Id: sliceId, Size: 1074933, Len: 1074933}, time.Now())
-	m.NewSlice(ctx, &sliceId)
+	m.NewSlice(ctx, 0, &sliceId)
 	_ = m.Write(ctx, inode, 2, 7663608, Slice{Id: sliceId, Size: 41480, Len: 4148}, time.Now())
 	_ = m.Fallocate(ctx, inode, fallocZeroRange, 2*ChunkSize+4515328, 3152428, nil)
 	_ = m.Fallocate(ctx, inode, fallocZeroRange, 2*ChunkSize+4515328, 2607724, nil)
@@ -2060,7 +2060,7 @@ func testCompaction(t *testing.T, m Meta, trash bool) {
 			inode, len(slices), slices[0].Len, slices[1].Len, slices[2].Len)
 	}
 
-	m.NewSlice(ctx, &sliceId)
+	m.NewSlice(ctx, 0, &sliceId)
 	_ = m.Write(ctx, inode, 3, 0, Slice{Id: sliceId, Size: 2338508, Len: 2338508}, time.Now())
 	_ = m.CopyFileRange(ctx, inode, 3*ChunkSize, inode, 4*ChunkSize, 2338508, 0, nil, nil)
 	_ = m.Fallocate(ctx, inode, fallocZeroRange, 4*ChunkSize, ChunkSize, nil)
@@ -2106,7 +2106,7 @@ func testConcurrentWrite(t *testing.T, m Meta) {
 			defer g.Done()
 			for j := 0; j < 100; j++ {
 				var sliceId uint64
-				m.NewSlice(ctx, &sliceId)
+				m.NewSlice(ctx, 0, &sliceId)
 				var slice = Slice{Id: sliceId, Size: 100, Len: 100}
 				st := m.Write(ctx, inode, indx, 0, slice, time.Now())
 				if st != 0 {
@@ -2128,7 +2128,7 @@ func testConcurrentWrite(t *testing.T, m Meta) {
 			defer g2.Done()
 			for j := 0; j < 1000; j++ {
 				var sliceId uint64
-				m.NewSlice(ctx, &sliceId)
+				m.NewSlice(ctx, 0, &sliceId)
 				var slice = Slice{Id: sliceId, Size: 100, Len: 100}
 				st := m.Write(ctx, inode, 0, uint32(200*j), slice, time.Now())
 				if st != 0 {
@@ -2280,13 +2280,13 @@ func testTrashSliceClaimRace(t *testing.T, m Meta) {
 
 	const sliceSize = 100
 	var liveSlice, delayedSlice uint64
-	if st := m.NewSlice(ctx, &liveSlice); st != 0 {
+	if st := m.NewSlice(ctx, 0, &liveSlice); st != 0 {
 		t.Fatalf("new live slice: %s", st)
 	}
 	if st := m.Write(ctx, inode, 0, 0, Slice{Id: liveSlice, Size: sliceSize, Len: sliceSize}, time.Now()); st != 0 {
 		t.Fatalf("write live slice: %s", st)
 	}
-	if st := m.NewSlice(ctx, &delayedSlice); st != 0 {
+	if st := m.NewSlice(ctx, 0, &delayedSlice); st != 0 {
 		t.Fatalf("new delayed slice: %s", st)
 	}
 	if st := m.Write(ctx, inode, 0, sliceSize, Slice{Id: delayedSlice, Size: sliceSize, Len: sliceSize}, time.Now()); st != 0 {
@@ -2427,7 +2427,7 @@ func testTruncateAndDelete(t *testing.T, m Meta) {
 	}
 	defer m.Unlink(ctx, 1, "f")
 	var sliceId uint64
-	if st := m.NewSlice(ctx, &sliceId); st != 0 {
+	if st := m.NewSlice(ctx, 0, &sliceId); st != 0 {
 		t.Fatalf("new chunk: %s", st)
 	}
 	if st := m.Write(ctx, inode, 0, 100, Slice{sliceId, 100, 0, 100}, time.Now()); st != 0 {
@@ -2497,7 +2497,7 @@ func testCopyFileRange(t *testing.T, m Meta) {
 
 	var sliceIds [4]uint64
 	for i := 0; i < len(sliceIds); i++ {
-		if st := m.NewSlice(Background(), &sliceIds[i]); st != 0 {
+		if st := m.NewSlice(Background(), 0, &sliceIds[i]); st != 0 {
 			t.Fatalf("new chunk: %s", st)
 		}
 	}
@@ -4210,7 +4210,7 @@ func testBatchClone(t *testing.T, m Meta) {
 		t.Fatalf("mknod file1: %s", st)
 	}
 	var sliceId1 uint64
-	if st := m.NewSlice(ctx, &sliceId1); st != 0 {
+	if st := m.NewSlice(ctx, 0, &sliceId1); st != 0 {
 		t.Fatalf("new slice: %s", st)
 	}
 	if st := m.Write(ctx, file1, 0, 0, Slice{sliceId1, 1024, 0, 1024}, time.Now()); st != 0 {
@@ -4454,7 +4454,7 @@ func testClone(t *testing.T, m Meta) {
 		t.Fatalf("mknod: %s", eno)
 	}
 	var sliceId uint64
-	if st := m.NewSlice(Background(), &sliceId); st != 0 {
+	if st := m.NewSlice(Background(), 0, &sliceId); st != 0 {
 		t.Fatalf("new chunk: %s", st)
 	}
 	if st := m.Write(Background(), file1, 0, 0, Slice{sliceId, 67108864, 0, 67108864}, time.Now()); st != 0 {
@@ -4466,7 +4466,7 @@ func testClone(t *testing.T, m Meta) {
 		t.Fatalf("mknod: %s", eno)
 	}
 	var sliceId2 uint64
-	if st := m.NewSlice(Background(), &sliceId2); st != 0 {
+	if st := m.NewSlice(Background(), 0, &sliceId2); st != 0 {
 		t.Fatalf("new chunk: %s", st)
 	}
 	if st := m.Write(Background(), file2, 0, 0, Slice{sliceId2, 67108863, 0, 67108863}, time.Now()); st != 0 {
@@ -5386,7 +5386,7 @@ func testCheckQuotaFileOwnerSimple(t *testing.T, m Meta) {
 	}
 
 	var sliceId uint64
-	if st := m.NewSlice(ctx, &sliceId); st != 0 {
+	if st := m.NewSlice(ctx, 0, &sliceId); st != 0 {
 		t.Fatalf("NewSlice: %s", st)
 	}
 	slice := Slice{Id: sliceId, Size: 4096, Len: 4096}
@@ -5397,7 +5397,7 @@ func testCheckQuotaFileOwnerSimple(t *testing.T, m Meta) {
 	}
 
 	var sliceId2 uint64
-	if st := m.NewSlice(ctx, &sliceId2); st != 0 {
+	if st := m.NewSlice(ctx, 0, &sliceId2); st != 0 {
 		t.Fatalf("NewSlice for second write: %s", st)
 	}
 	slice2 := Slice{Id: sliceId2, Size: 4096, Len: 4096}
@@ -5482,7 +5482,7 @@ func testQuotaEdgeCasesComplex(t *testing.T, m Meta) {
 	operatorCtx := &testContext{Context: context.Background(), uid: operatorUid, gid: operatorGid}
 	for i := 0; i < 5; i++ {
 		var sliceId uint64
-		if st := m.NewSlice(ctx, &sliceId); st != 0 {
+		if st := m.NewSlice(ctx, 0, &sliceId); st != 0 {
 			t.Fatalf("NewSlice %d: %s", i, st)
 		}
 		slice := Slice{Id: sliceId, Size: 1024 * 1024, Len: 1024 * 1024}
@@ -5520,7 +5520,7 @@ func testQuotaEdgeCasesComplex(t *testing.T, m Meta) {
 	}
 
 	var sliceId uint64
-	if st := m.NewSlice(ctx, &sliceId); st != 0 {
+	if st := m.NewSlice(ctx, 0, &sliceId); st != 0 {
 		t.Fatalf("NewSlice for space test: %s", st)
 	}
 	slice := Slice{Id: sliceId, Size: 2 * 1024 * 1024, Len: 2 * 1024 * 1024}
@@ -5574,7 +5574,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 		}
 
 		var sliceId uint64
-		if st := m.NewSlice(ctx, &sliceId); st != 0 {
+		if st := m.NewSlice(ctx, 0, &sliceId); st != 0 {
 			t.Fatalf("NewSlice: %s", st)
 		}
 		testSlice := Slice{Id: sliceId, Size: 1024, Len: 1024}
@@ -5616,7 +5616,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 		}
 
 		var smallSliceId uint64
-		if st := m.NewSlice(ctx, &smallSliceId); st != 0 {
+		if st := m.NewSlice(ctx, 0, &smallSliceId); st != 0 {
 			t.Fatalf("NewSlice for small data: %s", st)
 		}
 		smallSlice := Slice{Id: smallSliceId, Size: 512, Len: 512}
@@ -5626,7 +5626,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 		}
 
 		var largeSliceId uint64
-		if st := m.NewSlice(ctx, &largeSliceId); st != 0 {
+		if st := m.NewSlice(ctx, 0, &largeSliceId); st != 0 {
 			t.Fatalf("NewSlice for large data: %s", st)
 		}
 		largeSlice := Slice{Id: largeSliceId, Size: 1024, Len: 1024}
@@ -5650,7 +5650,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 		}
 
 		var initialSliceId uint64
-		if st := m.NewSlice(ctx, &initialSliceId); st != 0 {
+		if st := m.NewSlice(ctx, 0, &initialSliceId); st != 0 {
 			t.Fatalf("NewSlice for initial data: %s", st)
 		}
 		initialSlice := Slice{Id: initialSliceId, Size: 512, Len: 512}
@@ -5741,7 +5741,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 		}
 
 		var crossSliceId uint64
-		if st := m.NewSlice(ctx, &crossSliceId); st != 0 {
+		if st := m.NewSlice(ctx, 0, &crossSliceId); st != 0 {
 			t.Fatalf("NewSlice for cross data: %s", st)
 		}
 		crossSlice := Slice{Id: crossSliceId, Size: 1024, Len: 1024}
@@ -5784,7 +5784,7 @@ func testCheckQuotaFileOwner(t *testing.T, m Meta) {
 		}
 
 		var edgeSliceId uint64
-		if st := m.NewSlice(ctx, &edgeSliceId); st != 0 {
+		if st := m.NewSlice(ctx, 0, &edgeSliceId); st != 0 {
 			t.Fatalf("NewSlice for edge data: %s", st)
 		}
 		edgeSlice := Slice{Id: edgeSliceId, Size: 1, Len: 1}
@@ -6215,7 +6215,7 @@ func testHardlinkQuota(t *testing.T, m Meta, ctx Context, parent Ino, uid, gid u
 	}
 
 	var sliceId uint64
-	if st := m.NewSlice(ctx, &sliceId); st != 0 {
+	if st := m.NewSlice(ctx, 0, &sliceId); st != 0 {
 		t.Fatalf("NewSlice: %s", st)
 	}
 	slice := Slice{Id: sliceId, Size: uint32(fileSize), Len: uint32(fileSize)}
@@ -6525,7 +6525,7 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 			t.Fatalf("SetAttr UID and GID for %s: %s", fileName, st)
 		}
 		var sliceId uint64
-		if st := m.NewSlice(ctx, &sliceId); st != 0 {
+		if st := m.NewSlice(ctx, 0, &sliceId); st != 0 {
 			t.Fatalf("NewSlice for %s: %s", fileName, st)
 		}
 		slice := Slice{Id: sliceId, Size: uint32(fileSize), Len: uint32(fileSize)}
@@ -6607,7 +6607,7 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 		t.Fatalf("SetAttr UID and GID for original file: %s", st)
 	}
 	var sliceId uint64
-	if st := m.NewSlice(ctx, &sliceId); st != 0 {
+	if st := m.NewSlice(ctx, 0, &sliceId); st != 0 {
 		t.Fatalf("NewSlice for original file: %s", st)
 	}
 	slice := Slice{Id: sliceId, Size: uint32(hardlinkFileSize), Len: uint32(hardlinkFileSize)}
@@ -6711,7 +6711,7 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 		t.Fatalf("SetAttr UID and GID for multi-hardlink original file: %s", st)
 	}
 	var multiHardlinkSliceId uint64
-	if st := m.NewSlice(ctx, &multiHardlinkSliceId); st != 0 {
+	if st := m.NewSlice(ctx, 0, &multiHardlinkSliceId); st != 0 {
 		t.Fatalf("NewSlice for multi-hardlink original file: %s", st)
 	}
 	multiHardlinkSlice := Slice{Id: multiHardlinkSliceId, Size: uint32(multiHardlinkFileSize), Len: uint32(multiHardlinkFileSize)}

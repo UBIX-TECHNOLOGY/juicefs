@@ -46,7 +46,7 @@ Only flags explicitly specified are changed.
 
 Examples:
 # Show the current configurations
-$ juicefs config redis://localhost
+$ juicefs config ://localhost
 
 # Change volume "quota"
 $ juicefs config redis://localhost --inodes 10000000 --capacity 1048576
@@ -66,6 +66,10 @@ $ juicefs config redis://localhost --min-client-version 1.0.0 --max-client-versi
 				&cli.StringFlag{
 					Name:  "download-limit",
 					Usage: "default bandwidth limit of a client for download in Mbps",
+				},
+				&cli.BoolFlag{
+					Name:  "add-object-cluster",
+					Usage: "register a new object storage sub-cluster from --storage/--bucket (append-only, id assigned automatically)",
 				},
 			}),
 			formatManagementFlags(),
@@ -194,6 +198,44 @@ func config(ctx *cli.Context) error {
 
 	for _, flag := range ctx.LocalFlagNames() {
 		switch flag {
+		case "add-object-cluster":
+			if !ctx.IsSet("storage") || !ctx.IsSet("bucket") {
+				return fmt.Errorf("--add-object-cluster requires --storage and --bucket")
+			}
+			if len(format.ObjectClusters) >= int(meta.MaxObjectID) {
+				return fmt.Errorf("too many object clusters: max %d", meta.MaxObjectID)
+			}
+			if format.KeyEncrypted {
+				if err := format.Decrypt(); err != nil && !strings.Contains(err.Error(), "secret was removed") {
+					// a real decrypt failure would leave ciphertext garbage
+					// that the final Encrypt() would seal permanently
+					return fmt.Errorf("decrypt secrets: %s", err)
+				}
+			}
+			newCluster := meta.ObjectCluster{
+				ID:           uint8(len(format.ObjectClusters)) + 1,
+				Storage:      ctx.String("storage"),
+				StorageClass: format.StorageClass,
+				Bucket:       ctx.String("bucket"),
+				AccessKey:    ctx.String("access-key"),
+				SecretKey:    ctx.String("secret-key"),
+				SessionToken: ctx.String("session-token"),
+			}
+			testFormat, err := clusterFor(*format, &newCluster)
+			if err != nil {
+				return err
+			}
+			blob, err := createStorage(*testFormat)
+			if err != nil {
+				return err
+			}
+			err = test(context.Background(), blob)
+			object.Shutdown(blob)
+			if err != nil {
+				return err
+			}
+			format.ObjectClusters = append(format.ObjectClusters, newCluster)
+			msg.WriteString(fmt.Sprintf("%10s: add cluster %d (%s %s)\n", flag, newCluster.ID, newCluster.Storage, newCluster.Bucket))
 		case "capacity":
 			if new := utils.ParseBytes(ctx, flag, 'G'); new != format.Capacity {
 				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag,
@@ -209,12 +251,18 @@ func config(ctx *cli.Context) error {
 				quota = true
 			}
 		case "storage":
+			if ctx.Bool("add-object-cluster") {
+				continue // consumed by the object cluster registration above
+			}
 			if new := ctx.String(flag); new != format.Storage {
 				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, format.Storage, new))
 				format.Storage = new
 				storage = true
 			}
 		case "bucket":
+			if ctx.Bool("add-object-cluster") {
+				continue // consumed by the object cluster registration above
+			}
 			// bucket will be accessed before storage, so it is necessary to determine if storage is a file
 			if new := ctx.String(flag); new != format.Bucket {
 				effectiveStorage := format.Storage
@@ -233,7 +281,7 @@ func config(ctx *cli.Context) error {
 				storage = true
 			}
 		case "access-key":
-			if ctx.IsSet("tier") {
+			if ctx.IsSet("tier") || ctx.Bool("add-object-cluster") {
 				continue
 			}
 			if new := ctx.String(flag); new != format.AccessKey {
@@ -242,7 +290,7 @@ func config(ctx *cli.Context) error {
 				storage = true
 			}
 		case "secret-key": // always update
-			if ctx.IsSet("tier") {
+			if ctx.IsSet("tier") || ctx.Bool("add-object-cluster") {
 				continue
 			}
 			msg.WriteString(fmt.Sprintf("%10s: updated\n", flag))
@@ -252,7 +300,7 @@ func config(ctx *cli.Context) error {
 			format.SecretKey = ctx.String(flag)
 			storage = true
 		case "session-token": // always update
-			if ctx.IsSet("tier") {
+			if ctx.IsSet("tier") || ctx.Bool("add-object-cluster") {
 				continue
 			}
 			msg.WriteString(fmt.Sprintf("%10s: updated\n", flag))

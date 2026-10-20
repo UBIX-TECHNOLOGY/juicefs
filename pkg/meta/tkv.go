@@ -347,6 +347,127 @@ func (m *kvMeta) sustainedKey(sid uint64, inode Ino) []byte {
 	return m.fmtKey("SS", sid, inode)
 }
 
+// Inode bit layout (KV engines only):
+//
+//	63  58 57       50 49                            0
+//	┌───────┬──────────┬─────────────────────────────┐
+//	│ rsvd  │ objectID │ inode ID (monotonic)        │
+//	│ 6 bits│  8 bits  │  50 bits                    │
+//	└───────┴──────────┴─────────────────────────────┘
+//
+// Slice id bit layout (KV engines only):
+//
+//	63       56 55                                     0
+//	┌──────────┬───────────────────────────────────────┐
+//	│ objectID │ slice ID (monotonic)                  │
+//	│  8 bits  │  56 bits                              │
+//	└──────────┴───────────────────────────────────────┘
+//
+// The reserved inode bits are for future features (snapshot/clone) and
+// must stay 0 for now: trash inodes are derived as TrashInode + counter,
+// whose upper bits are non-zero, so non-zero reserved bits would break
+// the numeric-range checks IsTrash()/IsNormal(). A slice id carries its
+// owning object sub-cluster in the top 8 bits, so reads and deletes route
+// on the id alone. See docs/zh_cn/design/inode-layout-8-6-50.md for
+// details.
+const (
+	inodeReservedBits = 6
+	inodeObjectBits   = 8
+	inodeIDBits       = 50
+	sliceIDBits       = 56
+
+	maxReserved = (1 << inodeReservedBits) - 1
+	MaxObjectID = (1 << inodeObjectBits) - 1 // 255
+	maxInodeID  = (1 << inodeIDBits) - 1
+	maxSliceID  = (1 << sliceIDBits) - 1
+
+	inodeObjectShift   = inodeIDBits                   // 50
+	inodeReservedShift = inodeIDBits + inodeObjectBits // 58
+	sliceObjectShift   = sliceIDBits                   // 56
+)
+
+// composeInode combines the reserved bits, object cluster id and the
+// 50-bit inode id into a full inode. Each field is masked to its width so
+// an out-of-range value can never pollute its neighbors. The reserved
+// channel is reserved; current callers must always pass 0.
+func composeInode(reserved, objectID uint8, id uint64) Ino {
+	return Ino(uint64(reserved&maxReserved)<<inodeReservedShift |
+		uint64(objectID&MaxObjectID)<<inodeObjectShift |
+		id&maxInodeID)
+}
+
+// decomposeInode is the inverse of composeInode. The returned reserved
+// value is always 0 unless future features start using it.
+func decomposeInode(ino Ino) (reserved, objectID uint8, id uint64) {
+	u := uint64(ino)
+	return uint8(u >> inodeReservedShift), uint8(u >> inodeObjectShift), u & maxInodeID
+}
+
+// composeSliceID combines the object cluster id and the 56-bit slice id
+// into a routable slice id. Each field is masked to its width.
+func composeSliceID(objectID uint8, id uint64) uint64 {
+	return uint64(objectID&MaxObjectID)<<sliceObjectShift | id&maxSliceID
+}
+
+// sliceObjectID returns the object storage sub-cluster encoded in a
+// slice id; data of that slice lives in this cluster.
+func sliceObjectID(id uint64) uint8 { return uint8(id >> sliceObjectShift) }
+
+// sliceID strips the object sub-cluster prefix from a slice id, returning
+// the raw 56-bit counter value.
+func sliceID(id uint64) uint64 { return id & maxSliceID }
+
+// objectID returns the object storage sub-cluster id of a normal inode.
+// Only meaningful for IsNormal() inodes; trash / internal nodes live
+// outside the composed space.
+func (i Ino) objectID() uint8 { return uint8(uint64(i) >> inodeObjectShift) }
+
+// ObjectID is the exported form of objectID: the object storage sub-cluster
+// id encoded in the inode (KV engine layout). Callers must only use it for
+// normal inodes.
+func (i Ino) ObjectID() uint8 { return i.objectID() }
+
+func (i Ino) inodeID() uint64 { return uint64(i) & maxInodeID }
+
+// inodeComposer and sliceComposer are optional interfaces for KV engines
+// that compose inodes (6+8+50) and slice ids (8+56) from raw counters.
+// Engines not implementing them keep allocating raw counter values.
+type inodeComposer interface {
+	composeInode(ctx Context, id uint64, parent Ino) (Ino, error)
+}
+
+type sliceComposer interface {
+	composeSliceID(ctx Context, id uint64, objectID uint8) (uint64, error)
+}
+
+func (m *kvMeta) composeInode(ctx Context, id uint64, parent Ino) (Ino, error) {
+	if id > maxInodeID {
+		return 0, syscall.ENOSPC // inode id space exhausted, never carry into higher bits
+	}
+	// reserved bits are always 0 for now; the parameter channel is
+	// reserved for future snapshot/clone features.
+	objectID := parent.objectID()
+	if v := ctx.Value(ObjectIDCtxKey{}); v != nil {
+		// explicit request (e.g. juicefs mkdir --object-id) overrides the
+		// inherited value; the id must be registered in the cluster registry
+		objectID = v.(uint8)
+	}
+	if m.getFormat().ObjectClusterByID(objectID) == nil {
+		return 0, syscall.EINVAL // unregistered object cluster
+	}
+	return composeInode(0, objectID, id), nil
+}
+
+func (m *kvMeta) composeSliceID(ctx Context, id uint64, objectID uint8) (uint64, error) {
+	if id > maxSliceID {
+		return 0, syscall.ENOSPC // slice id space exhausted, never carry into higher bits
+	}
+	if m.getFormat().ObjectClusterByID(objectID) == nil {
+		return 0, syscall.EINVAL // unregistered object cluster
+	}
+	return composeSliceID(objectID, id), nil
+}
+
 func (m *kvMeta) encodeInode(ino Ino, buf []byte) {
 	binary.LittleEndian.PutUint64(buf, uint64(ino))
 }
@@ -502,6 +623,9 @@ func (m *kvMeta) scan(startKey, endKey []byte, limit int, filter func(k, v []byt
 }
 
 func (m *kvMeta) doInit(format *Format, force bool) error {
+	if err := format.validateObjectClusters(); err != nil {
+		return err
+	}
 	body, err := m.get(m.fmtKey("setting"))
 	if err != nil {
 		return err
@@ -4636,7 +4760,7 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 	srcInodes := make([]Ino, 0, len(entries))
 	srcInodeSet := make(map[Ino]struct{}, len(entries))
 	for i, e := range entries {
-		dstIno, err := m.nextInode()
+		dstIno, err := m.nextInode(ctx, e.Inode)
 		if err != nil {
 			return errno(err)
 		}

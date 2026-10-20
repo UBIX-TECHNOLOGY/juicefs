@@ -56,6 +56,8 @@ func (s *blockingChunkStore) CheckCache(id uint64, size uint32, parts []chunk.Ra
 func (s *blockingChunkStore) UsedMemory() int64                  { return 0 }
 func (s *blockingChunkStore) UpdateLimit(upload, download int64) {}
 func (s *blockingChunkStore) BlobStorage() object.ObjectStorage  { return nil }
+func (s *blockingChunkStore) SetClusterResolver(resolver func(cluster uint8) (object.ObjectStorage, error)) {
+}
 
 func createCancellationTestReader(t *testing.T, store chunk.ChunkStore) (*dataReader, Ino) {
 	t.Helper()
@@ -82,7 +84,7 @@ func createCancellationTestReader(t *testing.T, store chunk.ChunkStore) (*dataRe
 		t.Fatalf("create file: %s", st)
 	}
 	var sliceID uint64
-	if st := m.NewSlice(ctx, &sliceID); st != 0 {
+	if st := m.NewSlice(ctx, 0, &sliceID); st != 0 {
 		t.Fatalf("new slice: %s", st)
 	}
 	if st := m.Write(ctx, inode, 0, 0, meta.Slice{Id: sliceID, Size: 4, Len: 4}, time.Now()); st != 0 {

@@ -5707,7 +5707,7 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 	srcInodes := make([]Ino, 0, len(entries))
 	srcInodeSet := make(map[Ino]struct{}, len(entries))
 	for i, e := range entries {
-		dstIno, err := m.nextInode()
+		dstIno, err := m.nextInode(ctx, e.Inode)
 		if err != nil {
 			return errno(err)
 		}

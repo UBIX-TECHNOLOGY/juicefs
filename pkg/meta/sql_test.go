@@ -455,10 +455,10 @@ func TestSQLiteBatchUpdateChunkRefs(t *testing.T) {
 		t.Fatalf("mknod file: %s", st)
 	}
 	var slice1, slice2 uint64
-	if st := m.NewSlice(ctx, &slice1); st != 0 {
+	if st := m.NewSlice(ctx, 0, &slice1); st != 0 {
 		t.Fatalf("new slice1: %s", st)
 	}
-	if st := m.NewSlice(ctx, &slice2); st != 0 {
+	if st := m.NewSlice(ctx, 0, &slice2); st != 0 {
 		t.Fatalf("new slice2: %s", st)
 	}
 	const sliceSize = uint32(4096)
@@ -591,7 +591,7 @@ func TestSQLiteBatchCloneMultiRowInsert(t *testing.T) {
 			t.Fatalf("mknod %s: %s", name, st)
 		}
 		var id uint64
-		if st := m.NewSlice(ctx, &id); st != 0 {
+		if st := m.NewSlice(ctx, 0, &id); st != 0 {
 			t.Fatalf("new slice: %s", st)
 		}
 		if st := m.Write(ctx, ino, 0, 0, Slice{Id: id, Size: sliceSize, Len: sliceSize}, time.Now()); st != 0 {

@@ -52,4 +52,7 @@ type ChunkStore interface {
 	UsedMemory() int64
 	UpdateLimit(upload, download int64)
 	BlobStorage() object.ObjectStorage
+	// SetClusterResolver registers the lazy connector for extra object
+	// storage sub-clusters (cluster >= 1).
+	SetClusterResolver(resolver func(cluster uint8) (object.ObjectStorage, error))
 }

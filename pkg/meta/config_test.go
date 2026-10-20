@@ -90,3 +90,39 @@ func TestFormat_Update_KeyConflict(t *testing.T) {
 
 	assert.Equal(t, "secret", newFormat.SecretKey)
 }
+
+func TestFormat_Update_ObjectClustersReencrypt(t *testing.T) {
+	f := Format{Name: "test", UUID: "UUID-A", SecretKey: "top-secret"}
+	f.ObjectClusters = []ObjectCluster{{ID: 1, Storage: "file", Bucket: "/tmp/a/", SecretKey: "cluster-secret"}}
+	if err := f.Encrypt(); err != nil {
+		t.Fatal(err)
+	}
+	old := f.Clone()
+
+	// appending decrypts and re-encrypts the whole format, so unchanged entries
+	// keep their plaintext but receive fresh ciphertext.
+	appended := f.Clone()
+	if err := appended.Decrypt(); err != nil {
+		t.Fatal(err)
+	}
+	appended.ObjectClusters = append(appended.ObjectClusters, ObjectCluster{ID: 2, Storage: "file", Bucket: "/tmp/b/"})
+	if err := appended.Encrypt(); err != nil {
+		t.Fatal(err)
+	}
+	if err := appended.update(old, false); err != nil {
+		t.Fatalf("re-encrypted unchanged entries must still count as append-only: %s", err)
+	}
+
+	// a genuine modification of an existing entry is still rejected.
+	modified := f.Clone()
+	if err := modified.Decrypt(); err != nil {
+		t.Fatal(err)
+	}
+	modified.ObjectClusters[0].Bucket = "/tmp/other/"
+	if err := modified.Encrypt(); err != nil {
+		t.Fatal(err)
+	}
+	if err := modified.update(old, false); err == nil {
+		t.Fatal("modifying an existing cluster must fail")
+	}
+}

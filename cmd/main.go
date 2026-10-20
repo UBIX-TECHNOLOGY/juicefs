@@ -84,6 +84,7 @@ func Main(args []string) error {
 			cmdSync(),
 			cmdDebug(),
 			cmdClone(),
+			cmdMkdir(),
 			cmdSummary(),
 			cmdCompact(),
 			cmdTier(),

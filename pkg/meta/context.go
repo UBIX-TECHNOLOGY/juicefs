@@ -23,6 +23,16 @@ import (
 
 type CtxKey string
 
+// ObjectIDCtxKey carries an explicit object cluster id for inode creation
+// (e.g. `juicefs mkdir --object-id`); it overrides the value inherited
+// from the parent directory.
+type ObjectIDCtxKey struct{}
+
+// WithObjectID returns a context carrying the explicit object cluster id.
+func WithObjectID(ctx Context, id uint8) Context {
+	return ctx.WithValue(ObjectIDCtxKey{}, id)
+}
+
 type Context interface {
 	context.Context
 	Gid() uint32

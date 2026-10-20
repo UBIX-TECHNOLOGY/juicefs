@@ -542,8 +542,10 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 						cs.UsedInodes += 1
 					}
 					if inode < TrashInode {
-						if cs.NextInode <= int64(inode) {
-							cs.NextInode = int64(inode) + 1
+						// KV engines compose inodes as version|objectID|inodeID;
+						// the nextInode counter only tracks the raw 50-bit inode ID
+						if cs.NextInode <= int64(inode.inodeID()) {
+							cs.NextInode = int64(inode.inodeID()) + 1
 						}
 					} else {
 						if cs.NextTrash < int64(inode-TrashInode) {
@@ -566,8 +568,8 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 						if addChunk != nil && refs[ck] == 1 {
 							addChunk(&ck)
 						}
-						if cs.NextChunk <= int64(s.Id) {
-							cs.NextChunk = int64(s.Id) + 1
+						if cs.NextChunk <= int64(sliceID(s.Id)) {
+							cs.NextChunk = int64(sliceID(s.Id)) + 1
 						}
 					}
 				}

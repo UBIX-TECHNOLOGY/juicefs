@@ -75,7 +75,7 @@ func TestRedisBatchCloneSharedChunkRefs(t *testing.T) {
 		t.Fatalf("mknod file_A: %s", st)
 	}
 	var sliceID uint64
-	if st := m.NewSlice(ctx, &sliceID); st != 0 {
+	if st := m.NewSlice(ctx, 0, &sliceID); st != 0 {
 		t.Fatalf("new slice: %s", st)
 	}
 	const chunkSize = uint32(4096)
@@ -286,7 +286,7 @@ func TestRedisBatchCloneSpaceAccounting(t *testing.T) {
 			t.Fatalf("mknod %s: %s", name, st)
 		}
 		var sid uint64
-		if st := m.NewSlice(ctx, &sid); st != 0 {
+		if st := m.NewSlice(ctx, 0, &sid); st != 0 {
 			t.Fatalf("new slice for %s: %s", name, st)
 		}
 		if st := m.Write(ctx, ino, 0, 0, Slice{Id: sid, Size: sz, Off: 0, Len: sz}, time.Now()); st != 0 {
@@ -363,10 +363,10 @@ func TestRedisBatchCloneMultiChunkFile(t *testing.T) {
 	}
 
 	var slice1, slice2 uint64
-	if st := m.NewSlice(ctx, &slice1); st != 0 {
+	if st := m.NewSlice(ctx, 0, &slice1); st != 0 {
 		t.Fatalf("new slice1: %s", st)
 	}
-	if st := m.NewSlice(ctx, &slice2); st != 0 {
+	if st := m.NewSlice(ctx, 0, &slice2); st != 0 {
 		t.Fatalf("new slice2: %s", st)
 	}
 
@@ -542,7 +542,7 @@ func TestRedisBatchClonePartialFailureLeavesState(t *testing.T) {
 		t.Fatalf("mknod victim: %s", st)
 	}
 	var sid uint64
-	if st := m.NewSlice(ctx, &sid); st != 0 {
+	if st := m.NewSlice(ctx, 0, &sid); st != 0 {
 		t.Fatalf("new slice: %s", st)
 	}
 	const chunkSize = uint32(4096)

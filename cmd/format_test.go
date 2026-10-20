@@ -178,3 +178,66 @@ func TestFormatVersion(t *testing.T) {
 		t.Fatal("force bypassed incompatible metadata version")
 	}
 }
+
+func TestClusterForEncryptedFormat(t *testing.T) {
+	f := meta.Format{
+		Name:        "test",
+		UUID:        "UUID-A",
+		Storage:     "file",
+		Bucket:      "/tmp/top/",
+		SecretKey:   "top-secret",
+		EncryptAlgo: object.AES256GCM_RSA,
+	}
+	f.ObjectClusters = []meta.ObjectCluster{{
+		ID:           1,
+		Storage:      "file",
+		Bucket:       "/tmp/a/",
+		SecretKey:    "cluster-secret",
+		SessionToken: "cluster-token",
+	}}
+	if err := f.Encrypt(); err != nil {
+		t.Fatalf("encrypt: %s", err)
+	}
+	if !f.KeyEncrypted {
+		t.Fatal("format must be encrypted")
+	}
+	cipherClusterSecret := f.ObjectClusters[0].SecretKey
+
+	// mount-style: the cluster entry comes straight from the encrypted
+	// format, so its credentials are still ciphertext and clusterFor must
+	// decrypt the whole view
+	oc := f.ObjectClusters[0]
+	cf, err := clusterFor(f, &oc)
+	if err != nil {
+		t.Fatalf("clusterFor: %s", err)
+	}
+	if cf.KeyEncrypted {
+		t.Fatal("clusterFor must return a decrypted view")
+	}
+	if cf.SecretKey != "cluster-secret" || cf.SessionToken != "cluster-token" {
+		t.Fatalf("cluster credentials not decrypted: %q / %q", cf.SecretKey, cf.SessionToken)
+	}
+	if cf.Bucket != "/tmp/a/" || cf.Storage != "file" {
+		t.Fatalf("cluster view not overridden: %s %s", cf.Storage, cf.Bucket)
+	}
+	// the in-place decrypt must not leak into the caller's format
+	if f.ObjectClusters[0].SecretKey != cipherClusterSecret {
+		t.Fatalf("clusterFor mutated the caller's registry: %q", f.ObjectClusters[0].SecretKey)
+	}
+
+	// config-style: the caller decrypted the format beforehand, so the
+	// plaintext credentials from the CLI must pass through untouched
+	plain := f.Clone()
+	if err := plain.Decrypt(); err != nil {
+		t.Fatalf("decrypt: %s", err)
+	}
+	cf2, err := clusterFor(*plain, &meta.ObjectCluster{
+		ID: 2, Storage: "file", Bucket: "/tmp/b/", AccessKey: "ak", SecretKey: "plaintext-sk",
+	})
+	if err != nil {
+		t.Fatalf("clusterFor on decrypted format: %s", err)
+	}
+	if cf2.SecretKey != "plaintext-sk" || cf2.AccessKey != "ak" || cf2.Bucket != "/tmp/b/" {
+		t.Fatalf("plaintext credentials altered: %+v", cf2)
+	}
+}

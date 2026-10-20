@@ -29,6 +29,7 @@ import (
 
 	"github.com/dgraph-io/badger/v4"
 	aclAPI "github.com/juicedata/juicefs/pkg/acl"
+	pb "github.com/juicedata/juicefs/pkg/meta/pb"
 )
 
 type aclRollbackClient struct {
@@ -707,5 +708,402 @@ func TestBadgerDeleteTxnTooBig(t *testing.T) {
 
 	if err != badger.ErrTxnTooBig {
 		t.Fatalf("expected ErrTxnTooBig, got %v", err)
+	}
+}
+
+func TestInodeBitLayout(t *testing.T) {
+	for _, objectID := range []uint8{0, 1, 255} {
+		for _, id := range []uint64{1, (1 << 49) - 1, 1 << 49, maxInodeID} {
+			ino := composeInode(0, objectID, id)
+			if !ino.IsNormal() || ino.IsTrash() {
+				t.Fatalf("composed inode %d (objectID=%d, id=%d) is not a normal inode", ino, objectID, id)
+			}
+			reserved, gotObjectID, gotID := decomposeInode(ino)
+			if reserved != 0 {
+				t.Fatalf("expected reserved bits 0, got %d", reserved)
+			}
+			if gotObjectID != objectID || gotID != id {
+				t.Fatalf("round trip mismatch: got (objectID=%d, id=%d), want (objectID=%d, id=%d)",
+					gotObjectID, gotID, objectID, id)
+			}
+			if ino.objectID() != objectID || ino.inodeID() != id {
+				t.Fatalf("helper mismatch for inode %d", ino)
+			}
+		}
+	}
+	// every field is masked to its own width, out-of-range values never
+	// pollute their neighbors
+	ino := composeInode(0, 200, maxInodeID+1)
+	if v, o, id := decomposeInode(ino); v != 0 || o != 200&MaxObjectID || id != (maxInodeID+1)&maxInodeID {
+		t.Fatalf("masking failed: got (reserved=%d, objectID=%d, id=%d)", v, o, id)
+	}
+	// the reserved channel is 6 bits but must compose/parse losslessly
+	ino = composeInode(63, 255, maxInodeID)
+	if v, o, id := decomposeInode(ino); v != 63 || o != 255 || id != maxInodeID {
+		t.Fatalf("reserved round trip failed: got (reserved=%d, objectID=%d, id=%d)", v, o, id)
+	}
+}
+
+func TestSliceIDBitLayout(t *testing.T) {
+	for _, objectID := range []uint8{0, 1, 255} {
+		for _, id := range []uint64{1, (1 << 55) - 1, 1 << 55, maxSliceID} {
+			sid := composeSliceID(objectID, id)
+			if got := sliceObjectID(sid); got != objectID {
+				t.Fatalf("sliceObjectID: got %d, want %d", got, objectID)
+			}
+			if got := sliceID(sid); got != id {
+				t.Fatalf("sliceID: got %d, want %d", got, id)
+			}
+		}
+	}
+	// masking keeps the cluster bits and the bare id independent; an
+	// out-of-range bare id is truncated to the 56-bit space, never carrying
+	// into the cluster bits
+	sid := composeSliceID(255, maxSliceID+1)
+	if got := sliceObjectID(sid); got != 255 {
+		t.Fatalf("masking failed: objectID got %d, want 255", got)
+	}
+	if got := sliceID(sid); got != 0 {
+		t.Fatalf("masking failed: bare id got %d, want 0", got)
+	}
+}
+
+func TestKVMetaSliceIDComposition(t *testing.T) {
+	_ = os.Remove(settingPath)
+	t.Cleanup(func() { _ = os.Remove(settingPath) })
+	m, err := newKVMeta("memkv", "jfs-slice-compose", testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	format := testFormat()
+	// register one extra sub-cluster; cluster 0 stays the implicit top-level one
+	format.ObjectClusters = []ObjectCluster{{
+		ID:      1,
+		Storage: "file",
+		Bucket:  t.TempDir() + "/",
+	}}
+	if err := m.Init(format, true); err != nil {
+		t.Fatalf("init: %s", err)
+	}
+	defer m.Shutdown()
+
+	ctx := Background()
+	var id uint64
+	// slices allocated for a cluster-1 inode carry the cluster in the top 8 bits
+	if st := m.NewSlice(ctx, 1, &id); st != 0 {
+		t.Fatalf("new slice: %s", st)
+	}
+	if sliceObjectID(id) != 1 {
+		t.Fatalf("expected cluster bits 1, got %d", sliceObjectID(id))
+	}
+	if bare := sliceID(id); bare == 0 || bare >= 1<<56 {
+		t.Fatalf("unexpected bare slice id %d", bare)
+	}
+
+	// an unregistered object id is rejected
+	if st := m.NewSlice(ctx, 9, &id); st != syscall.EINVAL {
+		t.Fatalf("expected EINVAL for unregistered object id, got %v", st)
+	}
+
+	// the 56-bit bare space is capped with ENOSPC, never carrying into the
+	// cluster bits
+	kvm := m.(*kvMeta)
+	cur, err := kvm.getCounter("nextChunk")
+	if err != nil {
+		t.Fatalf("read counter: %s", err)
+	}
+	if _, err := kvm.incrCounter("nextChunk", int64(maxSliceID)-cur); err != nil {
+		t.Fatalf("setup counter: %s", err)
+	}
+	var lastBare uint64
+	for i := 0; i < sliceIdBatch*2+10; i++ {
+		var sid uint64
+		if st := m.NewSlice(ctx, 0, &sid); st != 0 {
+			if st != syscall.ENOSPC {
+				t.Fatalf("expected ENOSPC after slice id space is exhausted, got %v", st)
+			}
+			if lastBare != maxSliceID {
+				t.Fatalf("last bare slice id %d, want %d", lastBare, maxSliceID)
+			}
+			return
+		}
+		lastBare = sliceID(sid)
+	}
+	t.Fatal("expected ENOSPC within the allocation loop")
+}
+
+func TestKVMetaInodeComposition(t *testing.T) {
+	_ = os.Remove(settingPath)
+	t.Cleanup(func() { _ = os.Remove(settingPath) })
+	m, err := newKVMeta("memkv", "jfs-inode-compose", testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	format := testFormat()
+	// register one extra sub-cluster; cluster 0 stays the implicit top-level one
+	format.ObjectClusters = []ObjectCluster{{
+		ID:      1,
+		Storage: "file",
+		Bucket:  t.TempDir() + "/",
+	}}
+	if err := m.Init(format, true); err != nil {
+		t.Fatalf("init: %s", err)
+	}
+	defer m.Shutdown()
+
+	ctx := Background()
+	var dino, dino2, c1, c1sub, fino Ino
+	// inodes inherit the parent's object id; root is cluster 0
+	if st := m.Mkdir(ctx, RootInode, "d", 0755, 022, 0, &dino, nil); st != 0 {
+		t.Fatalf("mkdir: %s", st)
+	}
+	if st := m.Mkdir(ctx, dino, "d2", 0755, 022, 0, &dino2, nil); st != 0 {
+		t.Fatalf("mkdir nested: %s", st)
+	}
+	if dino.objectID() != 0 || dino2.objectID() != 0 {
+		t.Fatalf("expected inherited objectID 0, got %d / %d", dino.objectID(), dino2.objectID())
+	}
+	if _, _, id := decomposeInode(dino); id != 2 {
+		t.Fatalf("expected inode id 2, got %d", id)
+	}
+
+	// an explicit object id overrides the inherited value
+	if st := m.Mkdir(WithObjectID(ctx, 1), RootInode, "c1", 0755, 022, 0, &c1, nil); st != 0 {
+		t.Fatalf("mkdir with object id: %s", st)
+	}
+	if st := m.Mkdir(ctx, c1, "sub", 0755, 022, 0, &c1sub, nil); st != 0 {
+		t.Fatalf("mkdir under c1: %s", st)
+	}
+	if c1.objectID() != 1 || c1sub.objectID() != 1 {
+		t.Fatalf("expected objectID 1, got %d / %d", c1.objectID(), c1sub.objectID())
+	}
+	// files created under c1 inherit the cluster through the Mknod path too
+	if st := m.Mknod(ctx, c1, "f", TypeFile, 0644, 022, 0, "", &fino, nil); st != 0 {
+		t.Fatalf("mknod: %s", st)
+	}
+	if fino.objectID() != 1 {
+		t.Fatalf("expected file objectID 1, got %d", fino.objectID())
+	}
+
+	// an unregistered object id is rejected
+	if st := m.Mkdir(WithObjectID(ctx, 9), RootInode, "bad", 0755, 022, 0, new(Ino), nil); st != syscall.EINVAL {
+		t.Fatalf("expected EINVAL for unregistered object id, got %v", st)
+	}
+
+	// a clone shares the source's chunk records, so it must keep the
+	// source's object id even when cloned into another cluster's dir
+	var count, total uint64
+	var cl Ino
+	if st := m.Clone(ctx, c1, fino, dino, "cl", 0, 0, 1, &count, &total); st != 0 {
+		t.Fatalf("clone: %s", st)
+	}
+	if st := m.Lookup(ctx, dino, "cl", &cl, &Attr{}, false); st != 0 {
+		t.Fatalf("lookup clone: %s", st)
+	}
+	if cl.objectID() != 1 {
+		t.Fatalf("expected clone objectID 1 (source's), got %d", cl.objectID())
+	}
+
+	// rename moves the entry but never the data location
+	var rino Ino
+	if st := m.Rename(ctx, dino, "cl", dino, "cl2", 0, &rino, nil); st != 0 {
+		t.Fatalf("rename: %s", st)
+	}
+	if rino != cl || rino.objectID() != 1 {
+		t.Fatalf("rename must keep inode %d, got %d", cl, rino)
+	}
+}
+
+func TestKVMetaInodeIDExhausted(t *testing.T) {
+	_ = os.Remove(settingPath)
+	t.Cleanup(func() { _ = os.Remove(settingPath) })
+	m, err := newKVMeta("memkv", "jfs-inode-cap", testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	if err := m.Init(testFormat(), true); err != nil {
+		t.Fatalf("init: %s", err)
+	}
+	defer m.Shutdown()
+	kvm := m.(*kvMeta)
+	// move the counter right up to the end of the 50-bit space (Init has
+	// already consumed a couple of ids)
+	cur, err := kvm.getCounter("nextInode")
+	if err != nil {
+		t.Fatalf("read counter: %s", err)
+	}
+	if _, err := kvm.incrCounter("nextInode", int64(maxInodeID)-cur); err != nil {
+		t.Fatalf("setup counter: %s", err)
+	}
+	ino, err := kvm.nextInode(Background(), RootInode)
+	if err != nil {
+		t.Fatalf("allocate last inode: %s", err)
+	}
+	if want := composeInode(0, 0, maxInodeID); ino != want {
+		t.Fatalf("expected last inode %d, got %d", want, ino)
+	}
+	if _, err := kvm.nextInode(Background(), RootInode); err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC after inode id space is exhausted, got %v", err)
+	}
+}
+
+func TestFormatObjectClustersValidation(t *testing.T) {
+	f := testFormat()
+	if err := f.validateObjectClusters(); err != nil {
+		t.Fatalf("empty registry must be valid: %s", err)
+	}
+
+	// appending the first extra cluster on a fresh volume is allowed
+	f.ObjectClusters = []ObjectCluster{{ID: 1, Storage: "file", Bucket: "/tmp/a/"}}
+	if err := f.update(testFormat(), false); err != nil {
+		t.Fatalf("append on fresh volume: %s", err)
+	}
+
+	// appending a second cluster is allowed
+	old := f.Clone()
+	f.ObjectClusters = append(f.ObjectClusters, ObjectCluster{ID: 2, Storage: "file", Bucket: "/tmp/b/"})
+	if err := f.update(old, false); err != nil {
+		t.Fatalf("append on existing volume: %s", err)
+	}
+
+	// modifying an existing entry is rejected
+	bad := f.Clone()
+	bad.ObjectClusters[0].Bucket = "/tmp/other/"
+	if err := bad.update(f, false); err == nil {
+		t.Fatal("modifying an existing cluster must fail")
+	}
+	// shrinking the registry is rejected
+	bad = f.Clone()
+	bad.ObjectClusters = bad.ObjectClusters[:1]
+	if err := bad.update(f, false); err == nil {
+		t.Fatal("removing clusters must fail")
+	}
+	// ids must be contiguous from 1
+	bad = f.Clone()
+	bad.ObjectClusters[1].ID = 3
+	if err := bad.validateObjectClusters(); err == nil {
+		t.Fatal("non-contiguous ids must fail")
+	}
+
+	// 255 extra clusters fill the 8-bit object id space; one more is rejected
+	full := testFormat()
+	for i := 1; i <= int(MaxObjectID); i++ {
+		full.ObjectClusters = append(full.ObjectClusters, ObjectCluster{ID: uint8(i)})
+	}
+	if err := full.validateObjectClusters(); err != nil {
+		t.Fatalf("255 extra clusters must be valid: %s", err)
+	}
+	full.ObjectClusters = append(full.ObjectClusters, ObjectCluster{ID: 255})
+	if err := full.validateObjectClusters(); err == nil {
+		t.Fatal("256 extra clusters must fail")
+	}
+}
+
+func TestDumpedCountersUpdateFromSegmentComposedInode(t *testing.T) {
+	var counters []*pb.Counter
+	// a composed inode must rebuild the counter from its raw 50-bit id
+	loaded := DumpedCounters{NextInode: 2, NextChunk: 1}
+	seg := &BakSegment{typ: segTypeNode, val: &pb.Batch{Nodes: []*pb.Node{
+		{Inode: uint64(composeInode(0, 5, 100))},
+	}}}
+	if loaded.updateFromSegment(seg, &counters) {
+		t.Fatal("node segment should not be consumed")
+	}
+	if loaded.NextInode != 101 {
+		t.Fatalf("NextInode: got %d, want 101", loaded.NextInode)
+	}
+
+	// with mixed cluster ids the max raw id wins, not the max composed value
+	loaded = DumpedCounters{NextInode: 2, NextChunk: 1}
+	seg = &BakSegment{typ: segTypeNode, val: &pb.Batch{Nodes: []*pb.Node{
+		{Inode: uint64(composeInode(0, 255, 100))}, // largest composed value
+		{Inode: uint64(composeInode(0, 1, 200))},   // largest raw inode id
+	}}}
+	loaded.updateFromSegment(seg, &counters)
+	if loaded.NextInode != 201 {
+		t.Fatalf("NextInode: got %d, want 201", loaded.NextInode)
+	}
+
+	// a composed slice id must rebuild nextChunk from its raw 56-bit id
+	loaded = DumpedCounters{NextInode: 2, NextChunk: 1}
+	seg = &BakSegment{typ: segTypeSliceRef, val: &pb.Batch{SliceRefs: []*pb.SliceRef{
+		{Id: 1<<56 | 300},
+	}}}
+	loaded.updateFromSegment(seg, &counters)
+	if loaded.NextChunk != 301 {
+		t.Fatalf("NextChunk: got %d, want 301", loaded.NextChunk)
+	}
+
+	// trash inodes keep the legacy counter semantics
+	loaded = DumpedCounters{NextInode: 2, NextChunk: 1}
+	seg = &BakSegment{typ: segTypeNode, val: &pb.Batch{Nodes: []*pb.Node{
+		{Inode: uint64(TrashInode) + 7},
+	}}}
+	loaded.updateFromSegment(seg, &counters)
+	if loaded.NextTrash != 7 || loaded.NextInode != 2 {
+		t.Fatalf("trash record: NextTrash=%d NextInode=%d, want 7 and 2", loaded.NextTrash, loaded.NextInode)
+	}
+}
+
+func TestKVDumpLoadComposedInodeCounter(t *testing.T) {
+	_ = os.Remove(settingPath)
+	t.Cleanup(func() { _ = os.Remove(settingPath) })
+
+	// source volume with objectID=5: create a dir whose inode carries cluster bits
+	src, err := newKVMeta("memkv", "jfs-dump-src", testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	format := testFormat()
+	format.ObjectClusters = []ObjectCluster{{
+		ID:      1,
+		Storage: "file",
+		Bucket:  t.TempDir() + "/",
+	}}
+	if err := src.Init(format, true); err != nil {
+		t.Fatalf("init: %s", err)
+	}
+	var dino Ino
+	if st := src.Mkdir(WithObjectID(Background(), 1), RootInode, "d", 0755, 022, 0, &dino, nil); st != 0 {
+		t.Fatalf("mkdir: %s", st)
+	}
+	if dino.objectID() != 1 {
+		t.Fatalf("expected objectID 1, got %d", dino.objectID())
+	}
+	var buf bytes.Buffer
+	if err := src.DumpMeta(&buf, 0, 1, false, true, true); err != nil {
+		t.Fatalf("dump: %s", err)
+	}
+	if err := src.Shutdown(); err != nil {
+		t.Fatalf("shutdown: %s", err)
+	}
+
+	// load into a fresh empty volume
+	_ = os.Remove(settingPath)
+	dst, err := newKVMeta("memkv", "jfs-dump-dst", testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	defer dst.Shutdown()
+	if err := dst.LoadMeta(&buf); err != nil {
+		t.Fatalf("load: %s", err)
+	}
+	kvm := dst.(*kvMeta)
+	next, err := kvm.getCounter("nextInode")
+	if err != nil {
+		t.Fatalf("read counter: %s", err)
+	}
+	// the restored counter must hold the raw 50-bit inode id, not the
+	// composed value (which would exceed maxInodeID and fail every
+	// subsequent allocation with ENOSPC)
+	if want := int64(dino.inodeID()) + 1; next != want {
+		t.Fatalf("nextInode after load: got %d, want %d", next, want)
+	}
+	var nd Ino
+	if st := dst.Mkdir(Background(), RootInode, "d2", 0755, 022, 0, &nd, nil); st != 0 {
+		t.Fatalf("mkdir after load: %s", st)
+	}
+	if _, _, id := decomposeInode(nd); id != uint64(next) {
+		t.Fatalf("allocated inode id %d, want %d", id, next)
 	}
 }

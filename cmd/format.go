@@ -303,6 +303,37 @@ func createStorage(format meta.Format) (object.ObjectStorage, error) {
 	return blob, nil
 }
 
+// clusterFor returns a Format view whose top-level Storage/Bucket fields
+// point at the given object storage sub-cluster, so that createStorage()
+// can establish its connection.
+//
+// The cluster credentials may come straight from an encrypted format (the
+// mount resolver path), so they are filled in BEFORE Decrypt(); callers
+// holding plaintext credentials (the config command) must decrypt the
+// format themselves beforehand, which also turns the decrypt here into a
+// no-op.
+func clusterFor(format meta.Format, cluster *meta.ObjectCluster) (*meta.Format, error) {
+	f := format
+	// Decrypt() rewrites the registry slice in place; work on a private
+	// copy so the caller's format is never mutated
+	f.ObjectClusters = append([]meta.ObjectCluster(nil), format.ObjectClusters...)
+	f.Storage = cluster.Storage
+	f.StorageClass = cluster.StorageClass
+	f.Bucket = cluster.Bucket
+	f.AccessKey = cluster.AccessKey
+	f.SecretKey = cluster.SecretKey
+	f.SessionToken = cluster.SessionToken
+	if f.KeyEncrypted {
+		// createStorage calls Decrypt() which needs the volume UUID and
+		// KeyEncrypted=false semantics; the registry secrets share the
+		// same cipher, so reuse the volume-wide decrypt here
+		if err := f.Decrypt(); err != nil {
+			return nil, fmt.Errorf("decrypt format: %s", err)
+		}
+	}
+	return &f, nil
+}
+
 func initStorageTiers(storage object.ObjectStorage, tiers object.Tiers) {
 	if tierStorage, ok := storage.(object.SupportTier); ok {
 		if err := tierStorage.InitTiers(tiers); err != nil && hasConfiguredTiers(tiers) {

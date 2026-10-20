@@ -1399,7 +1399,7 @@ func (m *fsMachine) Write(t *rapid.T) {
 	indx := rapid.Uint32Range(0, 10).Draw(t, "indx")
 	pos := rapid.Uint32Range(0, ChunkSize).Draw(t, "pos")
 	var chunkid uint64
-	m.meta.NewSlice(m.ctx, &chunkid)
+	m.meta.NewSlice(m.ctx, 0, &chunkid)
 	cleng := rapid.Uint32Range(1, ChunkSize).Draw(t, "cleng")
 	off := rapid.Uint32Range(0, cleng-1).Draw(t, "off")
 	len := rapid.Uint32Range(1, cleng-off).Draw(t, "len")
