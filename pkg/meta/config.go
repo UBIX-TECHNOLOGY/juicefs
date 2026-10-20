@@ -121,7 +121,7 @@ type Format struct {
 // ObjectCluster describes one object storage sub-cluster. File data of an
 // inode is routed to the cluster recorded in the inode's objectID bits.
 type ObjectCluster struct {
-	ID           uint8
+	ID           uint32
 	Storage      string
 	StorageClass string `json:",omitempty"`
 	Bucket       string
@@ -133,7 +133,7 @@ type ObjectCluster struct {
 // ObjectClusterByID returns the registered cluster with the given id.
 // Cluster 0 is always the top-level storage config; ids >= 1 come from the
 // registry. It returns nil if the id is not registered.
-func (f *Format) ObjectClusterByID(id uint8) *ObjectCluster {
+func (f *Format) ObjectClusterByID(id uint32) *ObjectCluster {
 	if id == 0 {
 		return &ObjectCluster{
 			ID:           0,
@@ -210,14 +210,15 @@ func (f *Format) update(old *Format, force bool) error {
 }
 
 // validateObjectClusters checks that the registry is well-formed:
-// ids are contiguous from 1 (0 is the implicit top-level cluster), and the
-// total count does not exceed the 8-bit object id limit.
+// ids are contiguous from 1 (0 is the implicit top-level cluster), none
+// of them intrudes into the reserved object-id segment, and the count
+// stays within the 128-bit inode object id space.
 func (f *Format) validateObjectClusters() error {
-	if len(f.ObjectClusters) > int(MaxObjectID) {
-		return fmt.Errorf("too many object clusters: %d; max %d", len(f.ObjectClusters), MaxObjectID)
+	if uint32(len(f.ObjectClusters)) >= ReservedObjectIDBase {
+		return fmt.Errorf("too many object clusters: %d; max %d", len(f.ObjectClusters), ReservedObjectIDBase-1)
 	}
 	for i, c := range f.ObjectClusters {
-		if c.ID != uint8(i+1) {
+		if c.ID != uint32(i+1) {
 			return fmt.Errorf("object cluster ids must be contiguous from 1: index %d has id %d", i, c.ID)
 		}
 	}

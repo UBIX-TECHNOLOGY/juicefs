@@ -150,6 +150,42 @@ func getInternalNodeByName(name string) *internalNode {
 	return nil
 }
 
+// trackIno backfills the fuseInodes fast index for a normal inode.
+// Internal nodes (including trash) are excluded: their compressed fuse
+// inode number IS the meta inode, they never enter the map.
+func (v *VFS) trackIno(ino meta.Ino) {
+	if ino < minInternalNode {
+		if r, ok := v.Meta.(meta.Ino128Resolver); ok {
+			if i128, err := r.ResolveIno128(ino); err == nil {
+				v.fuseInodes.Store(uint64(ino), i128)
+			}
+		}
+	}
+}
+
+// ResolveIno maps a compressed 64-bit fuse inode number back to the full
+// 128-bit inode: the fast in-memory index first, then the meta engine's
+// persistent reverse index. A failed resolution (the inode is gone)
+// returns ESTALE, mirroring Lustre's FID-cache semantics. Engines
+// without a 128-bit inode space resolve to the identity mapping.
+func (v *VFS) ResolveIno(ino meta.Ino) (meta.Ino128, error) {
+	if ino >= minInternalNode || ino == meta.RootInode {
+		return meta.Ino128{ID: uint64(ino)}, nil
+	}
+	if i128, ok := v.fuseInodes.Load(uint64(ino)); ok {
+		return i128.(meta.Ino128), nil
+	}
+	if r, ok := v.Meta.(meta.Ino128Resolver); ok {
+		i128, err := r.ResolveIno128(ino)
+		if err != nil {
+			return meta.Ino128{}, err
+		}
+		v.fuseInodes.Store(uint64(ino), i128)
+		return i128, nil
+	}
+	return meta.Ino128{ID: uint64(ino)}, nil
+}
+
 func CollectMetrics(registry *prometheus.Registry) []byte {
 	if registry == nil {
 		return []byte("")

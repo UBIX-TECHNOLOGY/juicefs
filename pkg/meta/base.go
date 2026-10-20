@@ -2935,7 +2935,11 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 	// their compacted data lands on the always-registered implicit cluster 0
 	objectID := uint8(0)
 	if inode.IsNormal() {
-		objectID = inode.objectID()
+		if r, ok := m.en.(Ino128Resolver); ok {
+			if i128, err := r.ResolveIno128(inode); err == nil && i128.ObjectID <= MaxSliceObjectID {
+				objectID = uint8(i128.ObjectID)
+			}
+		}
 	}
 	if st = m.NewSlice(Background(), objectID, &id); st != 0 {
 		return

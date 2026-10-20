@@ -98,6 +98,9 @@ type kvMeta struct {
 	*baseMeta
 	client tkvClient
 	snap   map[Ino]*DumpedEntry
+	// inoCache memoizes the compressed-fuse-ino -> Ino128 mapping; the
+	// persistent "FI" reverse index is the source of truth.
+	inoCache sync.Map
 }
 
 var _ Meta = (*kvMeta)(nil)
@@ -159,7 +162,7 @@ func (m *kvMeta) keyLen(args ...interface{}) int {
 		case uint64:
 			c += 8
 		case Ino:
-			c += 8
+			c += 16 // full 128-bit inode: id(8) | objectID(4) | gen(4)
 		case string:
 			c += len(a)
 		default:
@@ -180,7 +183,7 @@ func (m *kvMeta) fmtKey(args ...interface{}) []byte {
 		case uint64:
 			b.Put64(a)
 		case Ino:
-			m.encodeInode(a, b.Get(8))
+			m.encodeInode(a, b.Get(16))
 		case string:
 			b.Put([]byte(a))
 		default:
@@ -347,13 +350,13 @@ func (m *kvMeta) sustainedKey(sid uint64, inode Ino) []byte {
 	return m.fmtKey("SS", sid, inode)
 }
 
-// Inode bit layout (KV engines only):
-//
-//	63  58 57       50 49                            0
-//	┌───────┬──────────┬─────────────────────────────┐
-//	│ rsvd  │ objectID │ inode ID (monotonic)        │
-//	│ 6 bits│  8 bits  │  50 bits                    │
-//	└───────┴──────────┴─────────────────────────────┘
+// Inode identity (KV engines only) is a 128-bit value laid out as
+// gen(32)|objectID(32)|inodeID(64), defined in ino128.go. The inode
+// flowing through the meta / vfs / fuse interfaces is the COMPRESSED
+// 64-bit form — the globally unique inode ID — so every key keeps its
+// 8-byte encoding and its hot-path scatter. kvMeta recovers the full
+// Ino128 from an in-memory cache plus the persistent "FI" reverse
+// index. See docs/zh_cn/design/inode-layout-32-32-64.md.
 //
 // Slice id bit layout (KV engines only):
 //
@@ -363,50 +366,20 @@ func (m *kvMeta) sustainedKey(sid uint64, inode Ino) []byte {
 //	│  8 bits  │  56 bits                              │
 //	└──────────┴───────────────────────────────────────┘
 //
-// The reserved inode bits are for future features (snapshot/clone) and
-// must stay 0 for now: trash inodes are derived as TrashInode + counter,
-// whose upper bits are non-zero, so non-zero reserved bits would break
-// the numeric-range checks IsTrash()/IsNormal(). A slice id carries its
-// owning object sub-cluster in the top 8 bits, so reads and deletes route
-// on the id alone. See docs/zh_cn/design/inode-layout-8-6-50.md for
-// details.
+// A slice id carries its owning object sub-cluster in the top 8 bits, so
+// reads and deletes route on the id alone.
 const (
-	inodeReservedBits = 6
-	inodeObjectBits   = 8
-	inodeIDBits       = 50
-	sliceIDBits       = 56
+	sliceIDBits = 56
 
-	maxReserved = (1 << inodeReservedBits) - 1
-	MaxObjectID = (1 << inodeObjectBits) - 1 // 255
-	maxInodeID  = (1 << inodeIDBits) - 1
-	maxSliceID  = (1 << sliceIDBits) - 1
-
-	inodeObjectShift   = inodeIDBits                   // 50
-	inodeReservedShift = inodeIDBits + inodeObjectBits // 58
-	sliceObjectShift   = sliceIDBits                   // 56
+	MaxSliceObjectID = (1 << 8) - 1 // slice id carries an 8-bit object id
+	maxSliceID       = (1 << sliceIDBits) - 1
+	sliceObjectShift = sliceIDBits // 56
 )
-
-// composeInode combines the reserved bits, object cluster id and the
-// 50-bit inode id into a full inode. Each field is masked to its width so
-// an out-of-range value can never pollute its neighbors. The reserved
-// channel is reserved; current callers must always pass 0.
-func composeInode(reserved, objectID uint8, id uint64) Ino {
-	return Ino(uint64(reserved&maxReserved)<<inodeReservedShift |
-		uint64(objectID&MaxObjectID)<<inodeObjectShift |
-		id&maxInodeID)
-}
-
-// decomposeInode is the inverse of composeInode. The returned reserved
-// value is always 0 unless future features start using it.
-func decomposeInode(ino Ino) (reserved, objectID uint8, id uint64) {
-	u := uint64(ino)
-	return uint8(u >> inodeReservedShift), uint8(u >> inodeObjectShift), u & maxInodeID
-}
 
 // composeSliceID combines the object cluster id and the 56-bit slice id
 // into a routable slice id. Each field is masked to its width.
 func composeSliceID(objectID uint8, id uint64) uint64 {
-	return uint64(objectID&MaxObjectID)<<sliceObjectShift | id&maxSliceID
+	return uint64(objectID&MaxSliceObjectID)<<sliceObjectShift | id&maxSliceID
 }
 
 // sliceObjectID returns the object storage sub-cluster encoded in a
@@ -417,21 +390,10 @@ func sliceObjectID(id uint64) uint8 { return uint8(id >> sliceObjectShift) }
 // the raw 56-bit counter value.
 func sliceID(id uint64) uint64 { return id & maxSliceID }
 
-// objectID returns the object storage sub-cluster id of a normal inode.
-// Only meaningful for IsNormal() inodes; trash / internal nodes live
-// outside the composed space.
-func (i Ino) objectID() uint8 { return uint8(uint64(i) >> inodeObjectShift) }
-
-// ObjectID is the exported form of objectID: the object storage sub-cluster
-// id encoded in the inode (KV engine layout). Callers must only use it for
-// normal inodes.
-func (i Ino) ObjectID() uint8 { return i.objectID() }
-
-func (i Ino) inodeID() uint64 { return uint64(i) & maxInodeID }
-
 // inodeComposer and sliceComposer are optional interfaces for KV engines
-// that compose inodes (6+8+50) and slice ids (8+56) from raw counters.
-// Engines not implementing them keep allocating raw counter values.
+// that compose 128-bit inodes and routable slice ids (8+56) from raw
+// counters. Engines not implementing them keep allocating raw counter
+// values as inodes / slice ids.
 type inodeComposer interface {
 	composeInode(ctx Context, id uint64, parent Ino) (Ino, error)
 }
@@ -440,40 +402,135 @@ type sliceComposer interface {
 	composeSliceID(ctx Context, id uint64, objectID uint8) (uint64, error)
 }
 
+// fiKey returns the key of the persistent reverse index that maps a
+// compressed 64-bit fuse inode back to its full 128-bit inode. It uses a
+// dedicated one-byte prefix ('Z') plus the RAW 64-bit inode so that (a)
+// encodeInode's own FI read cannot recurse, and (b) the broad "F" / "P"
+// prefix scans for flocks / plocks never pick these keys up.
+func (m *kvMeta) fiKey(ino Ino) []byte {
+	k := make([]byte, 9)
+	k[0] = 'Z'
+	binary.LittleEndian.PutUint64(k[1:], uint64(ino))
+	return k
+}
+
+// composeInode implements inodeComposer: it inherits (or takes from the
+// context) the object cluster id, validates it against the registry,
+// composes the full 128-bit inode and records it in the in-memory cache
+// and the persistent "FI" reverse index. The externally visible inode is
+// the compressed 64-bit inode ID.
 func (m *kvMeta) composeInode(ctx Context, id uint64, parent Ino) (Ino, error) {
-	if id > maxInodeID {
-		return 0, syscall.ENOSPC // inode id space exhausted, never carry into higher bits
+	p128, err := m.resolveIno128(parent)
+	if err != nil {
+		return 0, err
 	}
-	// reserved bits are always 0 for now; the parameter channel is
-	// reserved for future snapshot/clone features.
-	objectID := parent.objectID()
+	objectID := p128.ObjectID
+	if p128.IsTrash() {
+		// trash-derived creations fall back to the implicit cluster 0
+		objectID = 0
+	}
 	if v := ctx.Value(ObjectIDCtxKey{}); v != nil {
 		// explicit request (e.g. juicefs mkdir --object-id) overrides the
 		// inherited value; the id must be registered in the cluster registry
-		objectID = v.(uint8)
+		objectID = v.(uint32)
 	}
 	if m.getFormat().ObjectClusterByID(objectID) == nil {
 		return 0, syscall.EINVAL // unregistered object cluster
 	}
-	return composeInode(0, objectID, id), nil
+	i128, err := composeIno128(p128.Gen, objectID, id)
+	if err != nil {
+		return 0, err // inode id space exhausted; never cross the internal band
+	}
+	m.inoCache.Store(id, i128)
+	buf := make([]byte, 16)
+	encodeIno128(i128, buf)
+	if err := m.txn(ctx, func(tx *kvTxn) error {
+		tx.set(m.fiKey(Ino(id)), buf)
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return Ino(id), nil
 }
+
+// resolveIno128 maps a compressed 64-bit inode back to the full 128-bit
+// inode: the root and trash inodes are derived, everything else is looked
+// up in the in-memory cache and then in the persistent "FI" reverse
+// index. A missing entry means the inode is gone — ESTALE, like Lustre.
+func (m *kvMeta) resolveIno128(ino Ino) (Ino128, error) {
+	if ino == RootInode {
+		return Ino128{ID: uint64(ino)}, nil
+	}
+	if ino.IsTrash() {
+		return trashIno128(uint64(ino) - uint64(TrashInode)), nil
+	}
+	if v, ok := m.inoCache.Load(uint64(ino)); ok {
+		return v.(Ino128), nil
+	}
+	buf, err := m.get(m.fiKey(ino))
+	if err != nil {
+		return Ino128{}, err
+	}
+	if len(buf) != 16 {
+		return Ino128{}, syscall.ESTALE
+	}
+	i128 := decodeIno128(buf)
+	m.inoCache.Store(uint64(ino), i128)
+	return i128, nil
+}
+
+// ResolveIno128 implements Ino128Resolver.
+func (m *kvMeta) ResolveIno128(ino Ino) (Ino128, error) { return m.resolveIno128(ino) }
 
 func (m *kvMeta) composeSliceID(ctx Context, id uint64, objectID uint8) (uint64, error) {
 	if id > maxSliceID {
 		return 0, syscall.ENOSPC // slice id space exhausted, never carry into higher bits
 	}
-	if m.getFormat().ObjectClusterByID(objectID) == nil {
+	if m.getFormat().ObjectClusterByID(uint32(objectID)) == nil {
 		return 0, syscall.EINVAL // unregistered object cluster
 	}
 	return composeSliceID(objectID, id), nil
 }
 
-func (m *kvMeta) encodeInode(ino Ino, buf []byte) {
-	binary.LittleEndian.PutUint64(buf, uint64(ino))
+// resolveCached resolves the full 128-bit inode from the in-memory cache
+// and the root / trash derivations only. It performs NO storage IO, so it
+// is safe to call while a transaction is open (fmtKey calls encodeInode
+// inside txn closures). The cache is warmed by decodeInode whenever an
+// inode is parsed from a key and by the vfs ResolveIno entry points.
+func (m *kvMeta) resolveCached(ino Ino) (Ino128, bool) {
+	if ino == RootInode {
+		return Ino128{ID: uint64(ino)}, true
+	}
+	if ino.IsTrash() {
+		return trashIno128(uint64(ino) - uint64(TrashInode)), true
+	}
+	if v, ok := m.inoCache.Load(uint64(ino)); ok {
+		return v.(Ino128), true
+	}
+	return Ino128{}, false
 }
 
+// encodeInode writes the full 16-byte key form of an inode:
+// id(8,LE) | objectID(4,LE) | gen(4,LE) — the 128-bit inode
+// gen(32)|objectID(32)|inodeID(64) with the low counter bits first.
+// Resolution is cache-only (never IO): it is invoked from fmtKey inside
+// open transactions. Ids unknown to the cache fall back to a zero object
+// id so tombstone keys stay deterministic.
+func (m *kvMeta) encodeInode(ino Ino, buf []byte) {
+	i128, ok := m.resolveCached(ino)
+	if !ok {
+		i128 = Ino128{ID: uint64(ino)}
+	}
+	encodeIno128(i128, buf)
+}
+
+// decodeInode reads a 16-byte key-encoded inode back into the compressed
+// 64-bit fuse inode (the globally unique id) and memoizes the full
+// 128-bit form in the inoCache for later resolution.
 func (m *kvMeta) decodeInode(buf []byte) Ino {
-	return Ino(binary.LittleEndian.Uint64(buf))
+	i128 := decodeIno128(buf)
+	m.inoCache.Store(i128.ID, i128)
+	return Ino(i128.ID)
 }
 
 func (m *kvMeta) delfileKey(inode Ino, length uint64) []byte {
@@ -643,7 +700,7 @@ func (m *kvMeta) doInit(format *Format, force bool) error {
 			prefix := m.fmtKey("U")
 			err := m.client.txn(Background(), func(tx *kvTxn) error {
 				tx.scan(prefix, nextKey(prefix), true, func(k, v []byte) bool {
-					if len(k) == 9 {
+					if len(k) == 17 { // "U" + ino(16)
 						keys = append(keys, k)
 					}
 					return true
@@ -870,7 +927,7 @@ func (m *kvMeta) doCleanStaleSession(sid uint64) error {
 
 	if keys, err := m.scanKeys(ctx, m.fmtKey("SS", sid)); err == nil {
 		for _, key := range keys {
-			inode := m.decodeInode(key[10:]) // "SS" + sid
+			inode := m.decodeInode(key[10:]) // "SS" + sid(8); ino(16) runs to the end
 			if err = m.doDeleteSustainedInode(sid, inode); err != nil {
 				logger.Warnf("Delete sustained inode %d of sid %d: %s", inode, sid, err)
 				fail = true
@@ -949,7 +1006,7 @@ func (m *kvMeta) getSession(sid uint64, detail bool) (*Session, error) {
 		}
 		s.Sustained = make([]Ino, 0, len(inodes))
 		for _, sinode := range inodes {
-			inode := m.decodeInode(sinode[10:]) // "SS" + sid
+			inode := m.decodeInode(sinode[10:]) // "SS" + sid(8); ino(16) runs to the end
 			s.Sustained = append(s.Sustained, inode)
 		}
 		flocks, err := m.scanValues(ctx, m.fmtKey("F"), -1, nil)
@@ -957,7 +1014,7 @@ func (m *kvMeta) getSession(sid uint64, detail bool) (*Session, error) {
 			return nil, err
 		}
 		for k, v := range flocks {
-			inode := m.decodeInode([]byte(k[1:])) // "F"
+			inode := m.decodeInode([]byte(k[1:])) // "F"; ino(16) runs to the end
 			ls := unmarshalFlock(v)
 			for o, l := range ls {
 				if o.sid == sid {
@@ -970,7 +1027,7 @@ func (m *kvMeta) getSession(sid uint64, detail bool) (*Session, error) {
 			return nil, err
 		}
 		for k, v := range plocks {
-			inode := m.decodeInode([]byte(k[1:])) // "P"
+			inode := m.decodeInode([]byte(k[1:])) // "P"; ino(16) runs to the end
 			ls := unmarshalPlock(v)
 			for o, l := range ls {
 				if o.sid == sid {
@@ -1835,6 +1892,8 @@ func (m *kvMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skip
 				} else {
 					tx.set(m.delfileKey(inode, attr.Length), m.packInt64(now.Unix()))
 					tx.delete(m.inodeKey(inode))
+					tx.delete(m.fiKey(inode))
+					m.inoCache.Delete(uint64(inode))
 					newSpace, newInode = -align4K(attr.Length), -1
 				}
 			case TypeSymlink:
@@ -1842,6 +1901,8 @@ func (m *kvMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skip
 				fallthrough
 			default:
 				tx.delete(m.inodeKey(inode))
+				tx.delete(m.fiKey(inode))
+				m.inoCache.Delete(uint64(inode))
 				newSpace, newInode = -align4K(0), -1
 			}
 			tx.deleteKeys(m.xattrKey(inode, ""))
@@ -2283,6 +2344,8 @@ func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldA
 			tx.set(m.entryKey(trash, m.trashEntry(parent, inode, name)), buf)
 		} else {
 			tx.delete(m.inodeKey(inode))
+			tx.delete(m.fiKey(inode))
+			m.inoCache.Delete(uint64(inode))
 			tx.deleteKeys(m.xattrKey(inode, ""))
 		}
 		m.genLog(tx, now, "RMDIR(%d,%s,%d):%d", parent, logEncode2(name), trash, inode)
@@ -2760,12 +2823,12 @@ func (m *kvMeta) doScanSustainedInodes(ctx Context, fn func(uid, gid uint32, len
 	var attr Attr
 	for _, k := range vals {
 		b := utils.FromBuffer(k[2:])
-		if b.Len() != 16 {
+		if b.Len() != 24 { // sid(8) + ino(16)
 			logger.Warnf("Invalid sustainedKey: %v", k)
 			continue
 		}
 		_ = b.Get64()
-		inode := m.decodeInode(b.Get(8))
+		inode := m.decodeInode(b.Get(16))
 		if eno := m.doGetAttr(ctx, inode, &attr); eno != 0 {
 			logger.Warnf("Get attr of sustained inode %d: %s", inode, eno)
 			continue
@@ -3017,8 +3080,8 @@ func (m *kvMeta) getParents(tx *kvTxn, inode, parent Ino) []Ino {
 	var ps []Ino
 	prefix := m.fmtKey("A", inode, "P")
 	tx.scan(prefix, nextKey(prefix), false, func(k, v []byte) bool {
-		if len(k) == 1+8+1+8 && parseCounter(v) > 0 {
-			ps = append(ps, m.decodeInode([]byte(k[10:])))
+		if len(k) == 1+16+1+16 && parseCounter(v) > 0 {
+			ps = append(ps, m.decodeInode([]byte(k[18:])))
 		}
 		return true
 	})
@@ -3027,8 +3090,8 @@ func (m *kvMeta) getParents(tx *kvTxn, inode, parent Ino) []Ino {
 
 func (m *kvMeta) doGetParents(ctx Context, inode Ino) map[Ino]int {
 	vals, err := m.scanValues(ctx, m.fmtKey("A", inode, "P"), -1, func(k, v []byte) bool {
-		// parents: AiiiiiiiiPiiiiiiii
-		return len(k) == 1+8+1+8 && parseCounter(v) > 0
+		// parents: A<ino16>P<parent16>
+		return len(k) == 1+16+1+16 && parseCounter(v) > 0
 	})
 	if err != nil {
 		logger.Warnf("Scan parent key of inode %d: %s", inode, err)
@@ -3036,7 +3099,7 @@ func (m *kvMeta) doGetParents(ctx Context, inode Ino) map[Ino]int {
 	}
 	ps := make(map[Ino]int)
 	for k, v := range vals {
-		ps[m.decodeInode([]byte(k[10:]))] = int(parseCounter(v))
+		ps[m.decodeInode([]byte(k[18:]))] = int(parseCounter(v))
 	}
 	return ps
 }
@@ -3121,13 +3184,13 @@ func (m *kvMeta) doFindDeletedFiles(ts int64, limit int) (map[Ino]uint64, error)
 	if limit == 0 {
 		return nil, nil
 	}
-	klen := 1 + 8 + 8
+	klen := 1 + 16 + 8
 	files := make(map[Ino]uint64)
 	var count int
 	err := m.client.scan(m.fmtKey("D"), func(k, v []byte) bool {
 		if len(k) == klen && len(v) == 8 && m.parseInt64(v) < ts {
 			rb := utils.FromBuffer([]byte(k)[1:])
-			files[m.decodeInode(rb.Get(8))] = rb.Get64()
+			files[m.decodeInode(rb.Get(16))] = rb.Get64()
 			count++
 		}
 		return limit < 0 || count < limit
@@ -3213,7 +3276,7 @@ func (m *kvMeta) doDeleteFileData(inode Ino, length uint64) {
 		return
 	}
 	for i := range keys {
-		idx := binary.BigEndian.Uint32(keys[i][10:])
+		idx := binary.BigEndian.Uint32(keys[i][18:]) // "A" + ino(16) + "C"
 		err := m.deleteChunk(inode, idx)
 		if err != nil {
 			logger.Warnf("delete chunk %d:%d: %s", inode, idx, err)
@@ -3353,14 +3416,14 @@ func (m *kvMeta) doCompactChunk(inode Ino, indx uint32, buf []byte, ss []*slice,
 }
 
 func (m *kvMeta) scanAllChunks(ctx Context, ch chan<- cchunk, bar *utils.Bar) error {
-	// AiiiiiiiiCnnnn     file chunks
-	klen := 1 + 8 + 1 + 4
+	// A<ino16>Cnnnn     file chunks
+	klen := 1 + 16 + 1 + 4
 	return m.client.scan(m.fmtKey("A"), func(k, v []byte) bool {
-		if len(k) == klen && k[1+8] == 'C' && len(v) > sliceBytes {
+		if len(k) == klen && k[17] == 'C' && len(v) > sliceBytes {
 			bar.IncrTotal(1)
 			ch <- cchunk{
-				inode:  m.decodeInode(k[1:9]),
-				indx:   binary.BigEndian.Uint32(k[10:]),
+				inode:  m.decodeInode(k[1:17]),
+				indx:   binary.BigEndian.Uint32(k[18:]),
 				slices: len(v) / sliceBytes,
 			}
 		}
@@ -3369,14 +3432,14 @@ func (m *kvMeta) scanAllChunks(ctx Context, ch chan<- cchunk, bar *utils.Bar) er
 }
 
 func (m *kvMeta) ScanSlices(ctx Context, opt *ScanSlicesOption, fn func(Ino, Slice) error) syscall.Errno {
-	// AiiiiiiiiCnnnn     file chunks
-	klen := 1 + 8 + 1 + 4
+	// A<ino16>Cnnnn     file chunks
+	klen := 1 + 16 + 1 + 4
 	var cbErr error
 	err := m.client.scan(m.fmtKey("A"), func(key, value []byte) bool {
-		if len(key) != klen || key[1+8] != 'C' {
+		if len(key) != klen || key[17] != 'C' {
 			return true
 		}
-		inode := m.decodeInode([]byte(key)[1:9])
+		inode := m.decodeInode([]byte(key)[1:17])
 		ss := readSliceBuf(value)
 		if ss == nil {
 			logger.Errorf("Corrupt value for inode %d chunk key %s", inode, key)
@@ -3523,8 +3586,8 @@ func (m *kvMeta) scanPendingFiles(ctx Context, scan pendingFileScan) error {
 	if scan == nil {
 		return nil
 	}
-	// deleted files: Diiiiiiiissssssss
-	klen := 1 + 8 + 8
+	// deleted files: D<ino16>ssssssss
+	klen := 1 + 16 + 8
 
 	var scanErr error
 	if err := m.client.scan(m.fmtKey("D"), func(key, val []byte) bool {
@@ -3535,8 +3598,8 @@ func (m *kvMeta) scanPendingFiles(ctx Context, scan pendingFileScan) error {
 			scanErr = fmt.Errorf("invalid key %x", key)
 			return true
 		}
-		ino := m.decodeInode(key[1:9])
-		size := binary.BigEndian.Uint64(key[9:])
+		ino := m.decodeInode(key[1:17])
+		size := binary.BigEndian.Uint64(key[17:])
 		ts := m.parseInt64(val)
 		_, scanErr = scan(ino, size, ts)
 		return true
@@ -3766,7 +3829,7 @@ func (m *kvMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*Quota
 		quotas  map[uint64]*Quota
 		decode  func(k string) uint64
 	}{
-		{format.DirStats, "QD", "dir", dirQuotas, func(k string) uint64 { return uint64(m.decodeInode([]byte(k[2:]))) }}, // skip prefix
+		{format.DirStats, "QD", "dir", dirQuotas, func(k string) uint64 { return uint64(m.decodeInode([]byte(k[2:]))) }}, // skip 2-byte prefix; decodeInode reads the 16-byte inode
 		{format.UserGroupQuota, "QU", "user", userQuotas, func(k string) uint64 { return binary.BigEndian.Uint64([]byte(k[2:])) }},
 		{format.UserGroupQuota, "QG", "group", groupQuotas, func(k string) uint64 { return binary.BigEndian.Uint64([]byte(k[2:])) }},
 	}
@@ -3890,10 +3953,19 @@ func (m *kvMeta) dumpEntry(inode Ino, e *DumpedEntry, showProgress func(totalInc
 		}
 		dumpAttr(attr, e.Attr)
 		e.Attr.Inode = inode
+		// carry the 128-bit inode's object cluster id through the dump so
+		// load can rebuild the "FI" reverse index; cache-only because this
+		// runs inside a txn — the entry's inode was parsed from a key, so
+		// decodeInode has already warmed the cache
+		if inode < TrashInode && inode > RootInode {
+			if i128, ok := m.resolveCached(inode); ok {
+				e.Attr.ObjectID = i128.ObjectID
+			}
+		}
 
 		var xattrs []*DumpedXattr
 		tx.scan(m.xattrKey(inode, ""), nextKey(m.xattrKey(inode, "")), false, func(k, v []byte) bool {
-			xattrs = append(xattrs, &DumpedXattr{string(k[10:]), string(v)}) // "A" + inode + "X"
+			xattrs = append(xattrs, &DumpedXattr{string(k[18:]), string(v)}) // "A" + ino(16) + "X"
 			return true
 		})
 		if len(xattrs) > 0 {
@@ -3952,7 +4024,7 @@ func (m *kvMeta) dumpEntry(inode Ino, e *DumpedEntry, showProgress func(totalInc
 			if len(vals) < 10000 {
 				e.Entries = make(map[string]*DumpedEntry, len(vals))
 				for k, value := range vals {
-					name := k[10:]
+					name := k[18:]
 					ce := entryPool.Get()
 					ce.Name = name
 					typ, inode := m.parseEntry(value)
@@ -3980,7 +4052,7 @@ func (m *kvMeta) dumpDir(ctx Context, inode Ino, tree *DumpedEntry, bw *bufio.Wr
 		}
 		tree.Entries = make(map[string]*DumpedEntry, len(vals))
 		for k, value := range vals {
-			name := k[10:]
+			name := k[18:]
 			ce := entryPool.Get()
 			ce.Name = name
 			typ, inode := m.parseEntry(value)
@@ -4138,11 +4210,11 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 	dels := make([]*DumpedDelFile, 0, len(vals))
 	for k, v := range vals {
 		b := utils.FromBuffer([]byte(k[1:])) // "D"
-		if b.Len() != 16 {
+		if b.Len() != 24 {                   // ino(16) + size(8)
 			logger.Warnf("invalid delfileKey: %s", k)
 			continue
 		}
-		inode := m.decodeInode(b.Get(8))
+		inode := m.decodeInode(b.Get(16))
 		dels = append(dels, &DumpedDelFile{inode, b.Get64(), m.parseInt64(v)})
 	}
 
@@ -4175,14 +4247,14 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 		}
 
 		err := m.client.scan(nil, func(key, value []byte) bool {
-			if len(key) > 9 && key[0] == 'A' {
-				ino := m.decodeInode(key[1:9])
+			if len(key) > 17 && key[0] == 'A' {
+				ino := m.decodeInode(key[1:17])
 				e := m.snap[ino]
 				if e == nil {
 					e = &DumpedEntry{Attr: &DumpedAttr{Inode: ino}}
 					m.snap[ino] = e
 				}
-				switch key[9] {
+				switch key[17] {
 				case 'I':
 					attr := &Attr{Nlink: 1}
 					m.parseAttr(value, attr)
@@ -4191,7 +4263,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 					e.AccessACL = dumpACL(m.aclCache.Get(attr.AccessACL))
 					e.DefaultACL = dumpACL(m.aclCache.Get(attr.DefaultACL))
 				case 'C':
-					indx := binary.BigEndian.Uint32(key[10:])
+					indx := binary.BigEndian.Uint32(key[18:])
 					ss := readSliceBuf(value)
 					if ss == nil {
 						logger.Errorf("Corrupt value for inode %d chunk index %d", ino, indx)
@@ -4202,7 +4274,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 					}
 					e.Chunks = append(e.Chunks, &DumpedChunk{indx, slices})
 				case 'D':
-					name := string(key[10:])
+					name := string(key[18:])
 					typ, inode := m.parseEntry(value)
 					child := m.snap[inode]
 					if child == nil {
@@ -4216,7 +4288,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 					}
 					e.Entries[name] = child
 				case 'X':
-					e.Xattrs = append(e.Xattrs, &DumpedXattr{string(key[10:]), string(value)})
+					e.Xattrs = append(e.Xattrs, &DumpedXattr{string(key[18:]), string(value)})
 				case 'S':
 					e.Symlink = string(value)
 				}
@@ -4302,11 +4374,11 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 	ss := make(map[uint64][]Ino)
 	for k := range vals {
 		b := utils.FromBuffer([]byte(k[2:])) // "SS"
-		if b.Len() != 16 {
+		if b.Len() != 24 {                   // sid(8) + ino(16)
 			return fmt.Errorf("invalid sustainedKey: %s", k)
 		}
 		sid := b.Get64()
-		inode := m.decodeInode(b.Get(8))
+		inode := m.decodeInode(b.Get(16))
 		ss[sid] = append(ss[sid], inode)
 	}
 	sessions := make([]*DumpedSustained, 0, len(ss))
@@ -4316,7 +4388,7 @@ func (m *kvMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, 
 
 	// Fetch dir quotas
 	pairs, err := m.scanValues(ctx, m.fmtKey("QD"), -1, func(k, v []byte) bool {
-		return len(k) == 10 && len(v) == 32
+		return len(k) == 18 && len(v) == 32
 	})
 	if err != nil {
 		return err
@@ -4488,6 +4560,12 @@ func (m *kvMeta) loadEntry(e *DumpedEntry, kv chan *pair, aclMaxId *uint32) {
 	attr.AccessACL = m.saveACL(loadACL(e.AccessACL), aclMaxId)
 	attr.DefaultACL = m.saveACL(loadACL(e.DefaultACL), aclMaxId)
 	kv <- &pair{m.inodeKey(inode), m.marshal(attr)}
+	// seed the "FI" reverse index so a fresh process can resolve any
+	// loaded inode's full 128-bit form from its compressed 64-bit value;
+	// the dump format does not carry gen, so it defaults to 0
+	buf := make([]byte, 16)
+	encodeIno128(Ino128{ObjectID: e.Attr.ObjectID, ID: uint64(inode)}, buf)
+	kv <- &pair{m.fiKey(inode), buf}
 }
 
 func (m *kvMeta) LoadMeta(r io.Reader) error {
@@ -4712,7 +4790,7 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 
 func (m *kvMeta) doFindDetachedNodes(t time.Time) []Ino {
 	vals, err := m.scanValues(Background(), m.fmtKey("N"), -1, func(k, v []byte) bool {
-		return len(k) == 9 && m.parseInt64(v) < t.Unix()
+		return len(k) == 17 && m.parseInt64(v) < t.Unix() // "N" + ino(16)
 	})
 	if err != nil {
 		logger.Errorf("Scan detached nodes error: %s", err)

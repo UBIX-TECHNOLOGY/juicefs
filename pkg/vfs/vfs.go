@@ -200,6 +200,7 @@ func (v *VFS) Lookup(ctx Context, parent Ino, name string) (entry *meta.Entry, e
 	err = v.Meta.Lookup(ctx, parent, name, &inode, attr, true)
 	if err == 0 {
 		entry = &meta.Entry{Inode: inode, Attr: attr}
+		v.trackIno(inode)
 	}
 	return
 }
@@ -215,6 +216,7 @@ func (v *VFS) GetAttr(ctx Context, ino Ino, opened uint8) (entry *meta.Entry, er
 	err = v.Meta.GetAttr(ctx, ino, attr)
 	if err == 0 {
 		entry = &meta.Entry{Inode: ino, Attr: attr}
+		v.trackIno(ino)
 	}
 	return
 }
@@ -262,6 +264,7 @@ func (v *VFS) Mknod(ctx Context, parent Ino, name string, mode uint16, cumask ui
 	err = v.Meta.Mknod(ctx, parent, name, _type, mode&07777, cumask, rdev, "", &inode, attr)
 	if err == 0 {
 		entry = &meta.Entry{Inode: inode, Attr: attr}
+		v.trackIno(inode)
 		v.invalidateDirHandle(parent, name, inode, attr)
 	}
 	return
@@ -306,6 +309,7 @@ func (v *VFS) Mkdir(ctx Context, parent Ino, name string, mode uint16, cumask ui
 	err = v.Meta.Mkdir(ctx, parent, name, mode, cumask, 0, &inode, attr)
 	if err == 0 {
 		entry = &meta.Entry{Inode: inode, Attr: attr}
+		v.trackIno(inode)
 		v.invalidateDirHandle(parent, name, inode, attr)
 	}
 	return
@@ -342,6 +346,7 @@ func (v *VFS) Symlink(ctx Context, path string, parent Ino, name string) (entry 
 	err = v.Meta.Symlink(ctx, parent, name, path, &inode, attr)
 	if err == 0 {
 		entry = &meta.Entry{Inode: inode, Attr: attr}
+		v.trackIno(inode)
 		v.invalidateDirHandle(parent, name, inode, attr)
 	}
 	return
@@ -475,6 +480,9 @@ func (v *VFS) Readdir(ctx Context, ino Ino, size uint32, off int, fh uint64, plu
 	if entries, err = h.dirHandler.List(ctx, off); err != 0 {
 		return
 	}
+	for _, e := range entries {
+		v.trackIno(e.Inode)
+	}
 	readAt = h.readAt
 	logger.Debugf("readdir: [%d:%d] %d entries, offset=%d", ino, fh, len(entries), off)
 	return
@@ -535,6 +543,7 @@ func (v *VFS) Create(ctx Context, parent Ino, name string, mode uint16, cumask u
 		v.UpdateLength(inode, attr)
 		fh = v.newFileHandle(inode, attr.Length, flags, attr.Tier)
 		entry = &meta.Entry{Inode: inode, Attr: attr}
+		v.trackIno(inode)
 		v.invalidateDirHandle(parent, name, inode, attr)
 
 		if doUnlink {
@@ -1241,6 +1250,12 @@ type VFS struct {
 
 	modM       sync.Mutex
 	modifiedAt map[Ino]time.Time
+
+	// fuseInodes is the fast reverse index from the compressed 64-bit fuse
+	// inode number to the full 128-bit inode (KV engines only); misses fall
+	// back to the meta engine's persistent "FI" index, see
+	// docs/zh_cn/design/inode-layout-32-32-64.md.
+	fuseInodes sync.Map
 
 	registry *prometheus.Registry
 }

@@ -228,8 +228,8 @@ func (m *kvMeta) dumpMix(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) 
 			if e == nil {
 				break
 			}
-			ino := m.decodeInode(e.k[1:9])
-			switch e.k[9] {
+			ino := m.decodeInode(e.k[1:17])
+			switch e.k[17] {
 			case 'I':
 				typ = segTypeNode
 				node := pools[typ].Get().(*pb.Node)
@@ -241,7 +241,7 @@ func (m *kvMeta) dumpMix(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) 
 				typ = segTypeEdge
 				edge := pools[typ].Get().(*pb.Edge)
 				edge.Parent = uint64(ino)
-				edge.Name = e.k[10:]
+				edge.Name = e.k[18:]
 				nTyp, inode := m.parseEntry(e.v)
 				edge.Type, edge.Inode = uint32(nTyp), uint64(inode)
 				lists[typ].Edges = append(lists[typ].Edges, edge)
@@ -250,7 +250,7 @@ func (m *kvMeta) dumpMix(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) 
 				typ = segTypeChunk
 				chk := pools[typ].Get().(*pb.Chunk)
 				chk.Inode = uint64(ino)
-				chk.Index = binary.BigEndian.Uint32(e.k[10:])
+				chk.Index = binary.BigEndian.Uint32(e.k[18:])
 				chk.Slices = e.v
 				lists[typ].Chunks = append(lists[typ].Chunks, chk)
 				n = len(lists[typ].Chunks)
@@ -265,7 +265,7 @@ func (m *kvMeta) dumpMix(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) 
 				typ = segTypeXattr
 				xattr := pools[typ].Get().(*pb.Xattr)
 				xattr.Inode = uint64(ino)
-				xattr.Name = string(e.k[10:])
+				xattr.Name = string(e.k[18:])
 				xattr.Value = e.v
 				lists[typ].Xattrs = append(lists[typ].Xattrs, xattr)
 				n = len(lists[typ].Xattrs)
@@ -273,7 +273,7 @@ func (m *kvMeta) dumpMix(ctx Context, opt *DumpOption, ch chan<- *dumpedResult) 
 				typ = segTypeParent
 				parent := pools[typ].Get().(*pb.Parent)
 				parent.Inode = uint64(ino)
-				parent.Parent = uint64(m.decodeInode(e.k[10:]))
+				parent.Parent = uint64(m.decodeInode(e.k[18:]))
 				parent.Cnt = parseCounter(e.v)
 				lists[typ].Parents = append(lists[typ].Parents, parent)
 				n = len(lists[typ].Parents)
@@ -343,12 +343,12 @@ func (m *kvMeta) dumpSustained(ctx Context, opt *DumpOption, ch chan<- *dumpedRe
 		cnt := 0
 		tx.scan(m.fmtKey("SS"), nextKey(m.fmtKey("SS")), true, func(k, v []byte) bool {
 			b := utils.FromBuffer([]byte(k[2:])) // "SS"
-			if b.Len() != 16 {
+			if b.Len() != 24 {                   // sid(8) + ino(16)
 				logger.Warnf("invalid sustainedKey: %s", k)
 				return true
 			}
 			sid := b.Get64()
-			inode := uint64(m.decodeInode(b.Get(8)))
+			inode := uint64(m.decodeInode(b.Get(16)))
 			sids[sid] = append(sids[sid], inode)
 			cnt++
 			return true
@@ -370,11 +370,11 @@ func (m *kvMeta) dumpDelFiles(ctx Context, opt *DumpOption, ch chan<- *dumpedRes
 		delFiles := make([]*pb.DelFile, 0, kvDumpBatchSize)
 		tx.scan(m.fmtKey("D"), nextKey(m.fmtKey("D")), false, func(k, v []byte) bool {
 			b := utils.FromBuffer([]byte(k[1:])) // "D"
-			if b.Len() != 16 {
+			if b.Len() != 24 {                   // ino(16) + size(8)
 				logger.Warnf("invalid delfileKey: %s", k)
 				return true
 			}
-			inode := m.decodeInode(b.Get(8))
+			inode := m.decodeInode(b.Get(16))
 			delFiles = append(delFiles, &pb.DelFile{Inode: uint64(inode), Length: b.Get64(), Expire: m.parseInt64(v)})
 			return true
 		})

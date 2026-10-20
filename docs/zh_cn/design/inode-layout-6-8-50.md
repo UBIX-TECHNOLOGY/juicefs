@@ -452,6 +452,49 @@ type Format struct {
 | 读 | slice id 高 8 位 | `dataReader.readSlice` 按 `s.Id` 解析 object id 建连路由；同一文件引用多个历史 slice（跨集群 append 场景）时逐 slice 各归各的集群 |
 | 删 | slice id 高 8 位 | `DeleteSlice` 消息**无需参数扩展**（维持 `(id, size)` 原签名）：meta 层发出的 id 已含前缀，回调 `Remove(id, size)` 内部按 id 路由 |
 
+**当前 IO 流程图**（写入 / 读取 / 删除）：
+
+```mermaid
+flowchart TB
+    subgraph W["写入路径（write / compaction）"]
+        direction TB
+        A1["FUSE write"] --> A2["meta 分配 slice id：<br/>NewSlice(inode.objectID())<br/>slice id = objectID（高 8 位）+ 裸 ID（56 位）②<br/>随 chunk 记录持久化，即定型"]
+        A2 --> A3["wSlice 写块<br/>upload(s.id, key) → put(s.id, key)"]
+    end
+
+    subgraph R["读取路径（read）"]
+        direction TB
+        B1["FUSE read"] --> B2{"bcache 命中？"}
+        B2 -- 是 --> B3["直接返回"]
+        B2 -- 否 --> B4["dataReader 按记录中的完整 slice id<br/>逐 slice 读取（跨集群 append 时各 slice<br/>各归各的集群）<br/>rSlice.load / loadRange(s.id, key)"]
+    end
+
+    subgraph D["删除路径（delete）"]
+        direction TB
+        C1["DeleteSlice(id, size) ①（签名保持不变）"] --> C2["store.Remove(id, length)"]
+        C2 --> C3["rSlice.delete(s.id, key)"]
+    end
+
+    A3 --> E
+    B4 --> E
+    C3 --> E
+
+    E["storageForBlock(id, key)：唯一路由入口"]
+    E -- "活跃路径：id ≠ 0" --> F["cluster = id 右移 56 位（零解析）"]
+    E -- "回放路径：id = 0" --> G["clusterFromKey(key)<br/>从 block key 还原 slice id 取高 8 位<br/>（staging 重启回放、prefetch 等仅持有 key 的场景）"]
+    F --> H{"cluster 值"}
+    G --> H
+    H -- "0" --> I["顶层存储 store.storage"]
+    H -- "1~255" --> J["clusterStorage(cluster)：惰性建连<br/>resolver 查 ObjectClusters 注册表<br/>连接按需建立并缓存"]
+    J -- "未注册 / 建连失败" --> K["failedStorage：IO 显式报错<br/>禁止静默回退到其他集群"]
+```
+
+> ① 消息签名保持 `(id, size)` 不变；unlink、覆盖写清理、trash 清理、
+> gc 直删均经此消息，id 自带路由前缀，无需 inode 上下文。
+> ② 裸 ID 来自 `nextChunk` 计数器（56 位），越界返回 `ENOSPC` 禁止
+> 进位；compaction 分配新 slice 走同一入口，object_ID 取原 chunk
+> 所属 inode。
+
 **关键收益（相对早期按 inode 路由方案）**：
 
 1. `meta.Slice` 结构、`DeleteSlice`/`CompactChunk` 消息签名、

@@ -1205,3 +1205,43 @@ func testReaddir(t *testing.T, metaUri string, dirNum int, offset int) {
 	entriesTwo := readAll(ctx, parent, fh, offset)
 	require.True(t, reflect.DeepEqual(entriesOne, entriesTwo))
 }
+
+func TestVFSInodeMap(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
+	if _, ok := v.Meta.(meta.Ino128Resolver); !ok {
+		t.Fatal("memkv meta must implement Ino128Resolver")
+	}
+
+	// the root resolves to itself without touching the map
+	i128, err := v.ResolveIno(1)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), i128.ID)
+
+	// creating a dir backfills the fast index; the full 128-bit inode is
+	// recoverable with the compressed value as the key
+	de, e := v.Mkdir(ctx, 1, "d1", 0755, 0)
+	require.Equal(t, syscall.Errno(0), e)
+	ino := de.Inode
+	i128, err = v.ResolveIno(ino)
+	require.NoError(t, err)
+	require.Equal(t, uint64(ino), i128.ID)
+	require.Equal(t, uint32(0), i128.ObjectID)
+	_, hit := v.fuseInodes.Load(uint64(ino))
+	require.True(t, hit, "the fast index must be backfilled on mkdir")
+
+	// after the fast index entry is dropped, the persistent "FI" reverse
+	// index still resolves the inode (slow path)
+	v.fuseInodes.Delete(uint64(ino))
+	i128, err = v.ResolveIno(ino)
+	require.NoError(t, err)
+	require.Equal(t, uint64(ino), i128.ID)
+	_, hit = v.fuseInodes.Load(uint64(ino))
+	require.True(t, hit, "the slow path must backfill the fast index")
+
+	// after the inode is deleted, resolution fails with ESTALE
+	require.Equal(t, syscall.Errno(0), v.Rmdir(ctx, 1, "d1"))
+	v.fuseInodes.Delete(uint64(ino))
+	_, err = v.ResolveIno(ino)
+	require.Equal(t, syscall.ESTALE, err)
+}

@@ -48,8 +48,8 @@ $ juicefs mkdir redis://localhost /dir1 --object-id 2`,
 				Name:  "object-id",
 				Usage: "object storage sub-cluster id (0-255) for files under this directory; only supported by the TiKV engine",
 				Action: func(ctx *cli.Context, v int) error {
-					if v < 0 || v > int(meta.MaxObjectID) {
-						return fmt.Errorf("object-id should be between 0 and %d", meta.MaxObjectID)
+					if v < 0 || uint32(v) >= meta.ReservedObjectIDBase {
+						return fmt.Errorf("object-id should be between 0 and %d", meta.ReservedObjectIDBase-1)
 					}
 					return nil
 				},
@@ -74,13 +74,19 @@ func mkdir(ctx *cli.Context) error {
 	}
 	c := meta.Background()
 	if ctx.IsSet("object-id") {
-		c = meta.WithObjectID(c, uint8(ctx.Int("object-id")))
+		c = meta.WithObjectID(c, uint32(ctx.Int("object-id")))
 	}
 	var ino meta.Ino
 	eno = m.Mkdir(c, parentIno, filepath.Base(p), 0755, 0, 1, &ino, &meta.Attr{})
 	if eno != 0 {
 		return eno
 	}
-	fmt.Printf("Created directory %s (inode %d, object cluster %d)\n", p, ino, ino.ObjectID())
+	objectID := uint32(0)
+	if r, ok := m.(meta.Ino128Resolver); ok {
+		if i128, err := r.ResolveIno128(ino); err == nil {
+			objectID = i128.ObjectID
+		}
+	}
+	fmt.Printf("Created directory %s (inode %d, object cluster %d)\n", p, ino, objectID)
 	return nil
 }

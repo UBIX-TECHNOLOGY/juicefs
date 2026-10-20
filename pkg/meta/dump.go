@@ -74,7 +74,11 @@ type DumpedAttr struct {
 	Length    uint64 `json:"length"`
 	Rdev      uint32 `json:"rdev,omitempty"`
 	Tier      uint8  `json:"tier,omitempty"`
-	full      bool
+	// ObjectID is the object storage sub-cluster carried by the 128-bit
+	// inode (KV engines); 0 for the implicit top-level cluster. Kept for
+	// round-tripping the "FI" reverse index through dump/load.
+	ObjectID uint32 `json:"objectID,omitempty"`
+	full     bool
 }
 
 type DumpedSlice struct {
@@ -542,10 +546,11 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 						cs.UsedInodes += 1
 					}
 					if inode < TrashInode {
-						// KV engines compose inodes as version|objectID|inodeID;
-						// the nextInode counter only tracks the raw 50-bit inode ID
-						if cs.NextInode <= int64(inode.inodeID()) {
-							cs.NextInode = int64(inode.inodeID()) + 1
+						// KV engines store the full 128-bit inode beside the
+						// compressed 64-bit inode; the nextInode counter only
+						// tracks the raw 64-bit inode ID
+						if cs.NextInode <= int64(inode) {
+							cs.NextInode = int64(inode) + 1
 						}
 					} else {
 						if cs.NextTrash < int64(inode-TrashInode) {

@@ -89,13 +89,25 @@ type sliceWriter struct {
 	dep       *sliceWriter
 }
 
+// sliceObjectID returns the object storage sub-cluster of a normal inode
+// via the meta engine's 128-bit inode resolver; engines without the
+// resolver (and trash / special inodes) fall back to the implicit cluster 0.
+func sliceObjectID(m meta.Meta, ino meta.Ino) uint8 {
+	if r, ok := m.(meta.Ino128Resolver); ok {
+		if i128, err := r.ResolveIno128(ino); err == nil && i128.ObjectID <= meta.MaxSliceObjectID {
+			return uint8(i128.ObjectID)
+		}
+	}
+	return 0
+}
+
 func (s *sliceWriter) prepareID(ctx meta.Context, retry bool) {
 	f := s.chunk.file
 	f.Lock()
 	for s.id == 0 {
 		var id uint64
 		f.Unlock()
-		st := f.w.m.NewSlice(ctx, f.inode.ObjectID(), &id)
+		st := f.w.m.NewSlice(ctx, sliceObjectID(f.w.m, f.inode), &id)
 		f.Lock()
 		if st != 0 && st != syscall.EIO {
 			s.err = st

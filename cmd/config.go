@@ -202,8 +202,8 @@ func config(ctx *cli.Context) error {
 			if !ctx.IsSet("storage") || !ctx.IsSet("bucket") {
 				return fmt.Errorf("--add-object-cluster requires --storage and --bucket")
 			}
-			if len(format.ObjectClusters) >= int(meta.MaxObjectID) {
-				return fmt.Errorf("too many object clusters: max %d", meta.MaxObjectID)
+			if uint32(len(format.ObjectClusters)) >= meta.ReservedObjectIDBase-1 {
+				return fmt.Errorf("too many object clusters: max %d", meta.ReservedObjectIDBase-1)
 			}
 			if format.KeyEncrypted {
 				if err := format.Decrypt(); err != nil && !strings.Contains(err.Error(), "secret was removed") {
@@ -213,7 +213,7 @@ func config(ctx *cli.Context) error {
 				}
 			}
 			newCluster := meta.ObjectCluster{
-				ID:           uint8(len(format.ObjectClusters)) + 1,
+				ID:           uint32(len(format.ObjectClusters)) + 1,
 				Storage:      ctx.String("storage"),
 				StorageClass: format.StorageClass,
 				Bucket:       ctx.String("bucket"),

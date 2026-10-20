@@ -711,36 +711,42 @@ func TestBadgerDeleteTxnTooBig(t *testing.T) {
 	}
 }
 
-func TestInodeBitLayout(t *testing.T) {
-	for _, objectID := range []uint8{0, 1, 255} {
-		for _, id := range []uint64{1, (1 << 49) - 1, 1 << 49, maxInodeID} {
-			ino := composeInode(0, objectID, id)
+func TestIno128Layout(t *testing.T) {
+	for _, objectID := range []uint32{0, 1, 255, 0x12345678} {
+		for _, id := range []uint64{1, (1 << 49) - 1, 1 << 49, maxFuseInoID} {
+			ino, err := composeIno128(0, objectID, id)
+			if err != nil {
+				t.Fatalf("compose (objectID=%d, id=%d): %s", objectID, id, err)
+			}
 			if !ino.IsNormal() || ino.IsTrash() {
-				t.Fatalf("composed inode %d (objectID=%d, id=%d) is not a normal inode", ino, objectID, id)
+				t.Fatalf("composed inode %+v is not a normal inode", ino)
 			}
-			reserved, gotObjectID, gotID := decomposeInode(ino)
-			if reserved != 0 {
-				t.Fatalf("expected reserved bits 0, got %d", reserved)
+			// 16-byte round trip
+			var buf [16]byte
+			encodeIno128(ino, buf[:])
+			if got := decodeIno128(buf[:]); got != ino {
+				t.Fatalf("encode/decode round trip: got %+v, want %+v", got, ino)
 			}
-			if gotObjectID != objectID || gotID != id {
-				t.Fatalf("round trip mismatch: got (objectID=%d, id=%d), want (objectID=%d, id=%d)",
-					gotObjectID, gotID, objectID, id)
-			}
-			if ino.objectID() != objectID || ino.inodeID() != id {
-				t.Fatalf("helper mismatch for inode %d", ino)
+			// the compressed fuse inode is the unique 64-bit id itself
+			if got := ino.Ino(); got != Ino(id) {
+				t.Fatalf("compression: got %d, want %d", got, id)
 			}
 		}
 	}
-	// every field is masked to its own width, out-of-range values never
-	// pollute their neighbors
-	ino := composeInode(0, 200, maxInodeID+1)
-	if v, o, id := decomposeInode(ino); v != 0 || o != 200&MaxObjectID || id != (maxInodeID+1)&maxInodeID {
-		t.Fatalf("masking failed: got (reserved=%d, objectID=%d, id=%d)", v, o, id)
+	// the inode id counter must fail explicitly at both ends of the usable
+	// range, never carrying into or crossing the internal node band
+	if _, err := composeIno128(0, 1, 0); err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC for id 0, got %v", err)
 	}
-	// the reserved channel is 6 bits but must compose/parse losslessly
-	ino = composeInode(63, 255, maxInodeID)
-	if v, o, id := decomposeInode(ino); v != 63 || o != 255 || id != maxInodeID {
-		t.Fatalf("reserved round trip failed: got (reserved=%d, objectID=%d, id=%d)", v, o, id)
+	if _, err := composeIno128(0, 1, maxFuseInoID+1); err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC beyond the fuse range, got %v", err)
+	}
+	// trash inodes are tagged with the reserved object id segment and keep
+	// the full legacy inode value as their unique 64-bit id, so their key
+	// encoding never collides with normal inodes' ids
+	tr := trashIno128(7)
+	if !tr.IsTrash() || tr.IsNormal() || tr.ObjectID != ReservedTrashObjectID || tr.ID != uint64(TrashInode)+7 {
+		t.Fatalf("unexpected trash inode %+v", tr)
 	}
 }
 
@@ -832,6 +838,88 @@ func TestKVMetaSliceIDComposition(t *testing.T) {
 	t.Fatal("expected ENOSPC within the allocation loop")
 }
 
+func TestInodeKeyEncoding128(t *testing.T) {
+	_ = os.Remove(settingPath)
+	t.Cleanup(func() { _ = os.Remove(settingPath) })
+	m, err := newKVMeta("memkv", "jfs-key-enc-128", testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	format := testFormat()
+	format.ObjectClusters = []ObjectCluster{{ID: 1, Storage: "file", Bucket: t.TempDir() + "/"}}
+	if err := m.Init(format, true); err != nil {
+		t.Fatalf("init: %s", err)
+	}
+	defer m.Shutdown()
+	kvm := m.(*kvMeta)
+
+	var dino Ino
+	if st := m.Mkdir(WithObjectID(Background(), 1), RootInode, "d", 0755, 022, 0, &dino, nil); st != 0 {
+		t.Fatalf("mkdir: %s", st)
+	}
+
+	// the composed node key carries the full 16-byte inode:
+	// "A" + ino(16) + "I"
+	key := kvm.inodeKey(dino)
+	if len(key) != 1+16+1 {
+		t.Fatalf("node key length %d, want %d", len(key), 18)
+	}
+	i128 := decodeIno128(key[1:17])
+	if i128.ID != uint64(dino) || i128.ObjectID != 1 {
+		t.Fatalf("key round trip: got (id=%d, objectID=%d), want (id=%d, objectID=1)", i128.ID, i128.ObjectID, dino)
+	}
+
+	// cold resolution: with the in-memory cache cleared, the persistent
+	// reverse index recovers the full form (encodeInode itself is
+	// cache-only — it runs inside open txns — so the resolver entry warms
+	// the cache first); after that encodeInode produces identical bytes
+	kvm.inoCache.Delete(uint64(dino))
+	if _, err := kvm.ResolveIno128(dino); err != nil {
+		t.Fatalf("cold resolve: %s", err)
+	}
+	var buf [16]byte
+	kvm.encodeInode(dino, buf[:])
+	if !bytes.Equal(buf[:], key[1:17]) {
+		t.Fatalf("cold encode mismatch: %x vs %x", buf[:], key[1:17])
+	}
+	// decodeInode memoizes the resolved form again
+	if got := kvm.decodeInode(buf[:]); got != dino {
+		t.Fatalf("decode: got %d, want %d", got, dino)
+	}
+	if _, ok := kvm.inoCache.Load(uint64(dino)); !ok {
+		t.Fatal("decodeInode must backfill the in-memory cache")
+	}
+
+	// a cache miss encodes deterministically with a zero object id
+	// (deleted-inode tombstone keys stay stable across processes)
+	kvm.inoCache.Delete(uint64(dino))
+	kvm.encodeInode(dino, buf[:])
+	var buf2 [16]byte
+	kvm.encodeInode(dino, buf2[:])
+	if !bytes.Equal(buf[:], buf2[:]) || !bytes.Equal(buf[:], append([]byte{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})) {
+		t.Fatalf("tombstone encode not deterministic: %x vs %x", buf[:], buf2[:])
+	}
+
+	// trash inodes encode with the reserved object id and the full legacy
+	// value as the 64-bit id, never colliding with normal ids
+	tino := TrashInode + 5
+	kvm.encodeInode(tino, buf[:])
+	if got := decodeIno128(buf[:]); !got.IsTrash() || got.ID != uint64(tino) {
+		t.Fatalf("trash encode: got %+v", got)
+	}
+
+	// detached node keys carry the 16-byte inode too
+	if len(kvm.fmtKey("N", dino)) != 1+16 {
+		t.Fatal("detached node key must embed the 16-byte inode")
+	}
+
+	// entry values keep the compressed 64-bit form
+	packed := kvm.packEntry(TypeDirectory, dino)
+	if typ, ino := kvm.parseEntry(packed); typ != TypeDirectory || ino != dino {
+		t.Fatalf("entry value round trip failed: (%d, %d)", typ, ino)
+	}
+}
+
 func TestKVMetaInodeComposition(t *testing.T) {
 	_ = os.Remove(settingPath)
 	t.Cleanup(func() { _ = os.Remove(settingPath) })
@@ -860,11 +948,27 @@ func TestKVMetaInodeComposition(t *testing.T) {
 	if st := m.Mkdir(ctx, dino, "d2", 0755, 022, 0, &dino2, nil); st != 0 {
 		t.Fatalf("mkdir nested: %s", st)
 	}
-	if dino.objectID() != 0 || dino2.objectID() != 0 {
-		t.Fatalf("expected inherited objectID 0, got %d / %d", dino.objectID(), dino2.objectID())
+	resolver, ok := m.(Ino128Resolver)
+	if !ok {
+		t.Fatal("kvMeta must implement Ino128Resolver")
 	}
-	if _, _, id := decomposeInode(dino); id != 2 {
-		t.Fatalf("expected inode id 2, got %d", id)
+	i128, err := resolver.ResolveIno128(dino)
+	if err != nil {
+		t.Fatalf("resolve %d: %s", dino, err)
+	}
+	i128b, err := resolver.ResolveIno128(dino2)
+	if err != nil {
+		t.Fatalf("resolve %d: %s", dino2, err)
+	}
+	if i128.ObjectID != 0 || i128b.ObjectID != 0 {
+		t.Fatalf("expected inherited objectID 0, got %d / %d", i128.ObjectID, i128b.ObjectID)
+	}
+	if i128.ID != 2 {
+		t.Fatalf("expected inode id 2, got %d", i128.ID)
+	}
+	// the compressed fuse inode equals the raw 64-bit id
+	if dino != i128.Ino() {
+		t.Fatalf("compressed inode %d != id %d", dino, i128.ID)
 	}
 
 	// an explicit object id overrides the inherited value
@@ -874,15 +978,27 @@ func TestKVMetaInodeComposition(t *testing.T) {
 	if st := m.Mkdir(ctx, c1, "sub", 0755, 022, 0, &c1sub, nil); st != 0 {
 		t.Fatalf("mkdir under c1: %s", st)
 	}
-	if c1.objectID() != 1 || c1sub.objectID() != 1 {
-		t.Fatalf("expected objectID 1, got %d / %d", c1.objectID(), c1sub.objectID())
+	c1_128, err := resolver.ResolveIno128(c1)
+	if err != nil {
+		t.Fatalf("resolve %d: %s", c1, err)
+	}
+	c1sub_128, err := resolver.ResolveIno128(c1sub)
+	if err != nil {
+		t.Fatalf("resolve %d: %s", c1sub, err)
+	}
+	if c1_128.ObjectID != 1 || c1sub_128.ObjectID != 1 {
+		t.Fatalf("expected objectID 1, got %d / %d", c1_128.ObjectID, c1sub_128.ObjectID)
 	}
 	// files created under c1 inherit the cluster through the Mknod path too
 	if st := m.Mknod(ctx, c1, "f", TypeFile, 0644, 022, 0, "", &fino, nil); st != 0 {
 		t.Fatalf("mknod: %s", st)
 	}
-	if fino.objectID() != 1 {
-		t.Fatalf("expected file objectID 1, got %d", fino.objectID())
+	fino_128, err := resolver.ResolveIno128(fino)
+	if err != nil {
+		t.Fatalf("resolve %d: %s", fino, err)
+	}
+	if fino_128.ObjectID != 1 {
+		t.Fatalf("expected file objectID 1, got %d", fino_128.ObjectID)
 	}
 
 	// an unregistered object id is rejected
@@ -900,8 +1016,12 @@ func TestKVMetaInodeComposition(t *testing.T) {
 	if st := m.Lookup(ctx, dino, "cl", &cl, &Attr{}, false); st != 0 {
 		t.Fatalf("lookup clone: %s", st)
 	}
-	if cl.objectID() != 1 {
-		t.Fatalf("expected clone objectID 1 (source's), got %d", cl.objectID())
+	cl_128, err := resolver.ResolveIno128(cl)
+	if err != nil {
+		t.Fatalf("resolve %d: %s", cl, err)
+	}
+	if cl_128.ObjectID != 1 {
+		t.Fatalf("expected clone objectID 1 (source's), got %d", cl_128.ObjectID)
 	}
 
 	// rename moves the entry but never the data location
@@ -909,8 +1029,12 @@ func TestKVMetaInodeComposition(t *testing.T) {
 	if st := m.Rename(ctx, dino, "cl", dino, "cl2", 0, &rino, nil); st != 0 {
 		t.Fatalf("rename: %s", st)
 	}
-	if rino != cl || rino.objectID() != 1 {
+	if rino != cl {
 		t.Fatalf("rename must keep inode %d, got %d", cl, rino)
+	}
+	r_128, err := resolver.ResolveIno128(rino)
+	if err != nil || r_128.ObjectID != 1 {
+		t.Fatalf("rename must keep objectID 1, got %d (%v)", r_128.ObjectID, err)
 	}
 }
 
@@ -926,20 +1050,20 @@ func TestKVMetaInodeIDExhausted(t *testing.T) {
 	}
 	defer m.Shutdown()
 	kvm := m.(*kvMeta)
-	// move the counter right up to the end of the 50-bit space (Init has
-	// already consumed a couple of ids)
+	// move the counter right up to the end of the usable fuse range (Init
+	// has already consumed a couple of ids)
 	cur, err := kvm.getCounter("nextInode")
 	if err != nil {
 		t.Fatalf("read counter: %s", err)
 	}
-	if _, err := kvm.incrCounter("nextInode", int64(maxInodeID)-cur); err != nil {
+	if _, err := kvm.incrCounter("nextInode", int64(maxFuseInoID)-cur); err != nil {
 		t.Fatalf("setup counter: %s", err)
 	}
 	ino, err := kvm.nextInode(Background(), RootInode)
 	if err != nil {
 		t.Fatalf("allocate last inode: %s", err)
 	}
-	if want := composeInode(0, 0, maxInodeID); ino != want {
+	if want := Ino(maxFuseInoID); ino != want {
 		t.Fatalf("expected last inode %d, got %d", want, ino)
 	}
 	if _, err := kvm.nextInode(Background(), RootInode); err != syscall.ENOSPC {
@@ -985,26 +1109,21 @@ func TestFormatObjectClustersValidation(t *testing.T) {
 		t.Fatal("non-contiguous ids must fail")
 	}
 
-	// 255 extra clusters fill the 8-bit object id space; one more is rejected
-	full := testFormat()
-	for i := 1; i <= int(MaxObjectID); i++ {
-		full.ObjectClusters = append(full.ObjectClusters, ObjectCluster{ID: uint8(i)})
-	}
-	if err := full.validateObjectClusters(); err != nil {
-		t.Fatalf("255 extra clusters must be valid: %s", err)
-	}
-	full.ObjectClusters = append(full.ObjectClusters, ObjectCluster{ID: 255})
-	if err := full.validateObjectClusters(); err == nil {
-		t.Fatal("256 extra clusters must fail")
+	// ids must never intrude into the reserved object id segment
+	bad = f.Clone()
+	bad.ObjectClusters[1].ID = ReservedTrashObjectID
+	if err := bad.validateObjectClusters(); err == nil {
+		t.Fatal("a cluster id inside the reserved segment must fail")
 	}
 }
 
 func TestDumpedCountersUpdateFromSegmentComposedInode(t *testing.T) {
 	var counters []*pb.Counter
-	// a composed inode must rebuild the counter from its raw 50-bit id
+	// the nextInode counter tracks the raw 64-bit inode id, which now IS
+	// the compressed fuse inode number
 	loaded := DumpedCounters{NextInode: 2, NextChunk: 1}
 	seg := &BakSegment{typ: segTypeNode, val: &pb.Batch{Nodes: []*pb.Node{
-		{Inode: uint64(composeInode(0, 5, 100))},
+		{Inode: 100},
 	}}}
 	if loaded.updateFromSegment(seg, &counters) {
 		t.Fatal("node segment should not be consumed")
@@ -1013,11 +1132,11 @@ func TestDumpedCountersUpdateFromSegmentComposedInode(t *testing.T) {
 		t.Fatalf("NextInode: got %d, want 101", loaded.NextInode)
 	}
 
-	// with mixed cluster ids the max raw id wins, not the max composed value
+	// the max raw id wins
 	loaded = DumpedCounters{NextInode: 2, NextChunk: 1}
 	seg = &BakSegment{typ: segTypeNode, val: &pb.Batch{Nodes: []*pb.Node{
-		{Inode: uint64(composeInode(0, 255, 100))}, // largest composed value
-		{Inode: uint64(composeInode(0, 1, 200))},   // largest raw inode id
+		{Inode: 100},
+		{Inode: 200},
 	}}}
 	loaded.updateFromSegment(seg, &counters)
 	if loaded.NextInode != 201 {
@@ -1067,8 +1186,10 @@ func TestKVDumpLoadComposedInodeCounter(t *testing.T) {
 	if st := src.Mkdir(WithObjectID(Background(), 1), RootInode, "d", 0755, 022, 0, &dino, nil); st != 0 {
 		t.Fatalf("mkdir: %s", st)
 	}
-	if dino.objectID() != 1 {
-		t.Fatalf("expected objectID 1, got %d", dino.objectID())
+	if r, ok := src.(Ino128Resolver); !ok {
+		t.Fatal("kvMeta must implement Ino128Resolver")
+	} else if i128, err := r.ResolveIno128(dino); err != nil || i128.ObjectID != 1 {
+		t.Fatalf("expected objectID 1, got %d (%v)", i128.ObjectID, err)
 	}
 	var buf bytes.Buffer
 	if err := src.DumpMeta(&buf, 0, 1, false, true, true); err != nil {
@@ -1093,17 +1214,16 @@ func TestKVDumpLoadComposedInodeCounter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read counter: %s", err)
 	}
-	// the restored counter must hold the raw 50-bit inode id, not the
-	// composed value (which would exceed maxInodeID and fail every
-	// subsequent allocation with ENOSPC)
-	if want := int64(dino.inodeID()) + 1; next != want {
+	// the restored counter must hold the raw 64-bit inode id, which is
+	// also the compressed fuse inode number
+	if want := int64(dino) + 1; next != want {
 		t.Fatalf("nextInode after load: got %d, want %d", next, want)
 	}
 	var nd Ino
 	if st := dst.Mkdir(Background(), RootInode, "d2", 0755, 022, 0, &nd, nil); st != 0 {
 		t.Fatalf("mkdir after load: %s", st)
 	}
-	if _, _, id := decomposeInode(nd); id != uint64(next) {
-		t.Fatalf("allocated inode id %d, want %d", id, next)
+	if nd != Ino(next) {
+		t.Fatalf("allocated inode %d, want %d", nd, next)
 	}
 }

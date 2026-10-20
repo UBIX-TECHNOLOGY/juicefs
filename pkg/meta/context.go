@@ -29,7 +29,7 @@ type CtxKey string
 type ObjectIDCtxKey struct{}
 
 // WithObjectID returns a context carrying the explicit object cluster id.
-func WithObjectID(ctx Context, id uint8) Context {
+func WithObjectID(ctx Context, id uint32) Context {
 	return ctx.WithValue(ObjectIDCtxKey{}, id)
 }
 
